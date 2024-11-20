@@ -23,10 +23,10 @@ class States:
     multiplicities : np.array = np.array([1, 3, 1, 9, 3, 3, 1, 9, 15, 5, 3])
     energies : np.array = np.array([0.00, 19.819614525, 20.615774823, 20.96408688908, 21.2180227112, 22.718466419, 22.920317359, 23.00707314571, 23.07365070854, 23.07407479777, 23.08701852960]) * u.eV
     ionization_species : np.array = field(default_factory=lambda: ["HeII", "HeIII"])
-
+    
     def __post_init__(self):
         self.all_names = self.names + self.ionization_species
-
+    
     def __hash__(self):
         return hash(tuple(self.names))
     
@@ -47,6 +47,18 @@ class States:
     def get_fancy_names(self):
         return {name: f"$1s{name[0:-2]}{name[-1].lower()}^{name[-2]}{name[-1]}$" for name in self.names} | {"HeII": "$He^{+}$", "HeIII": "$He^{2+}$"}
     
+    def texify_names(self):
+        print("existing names are", self.names)
+        names_data = pandas.Series(self.names).apply(lambda x: x.split(" "))
+        names_tex = []
+        for i in range(len(names_data)):
+            config, term, J = names_data[i]
+            spin_mul, L, parity = [re.match('(\d+)(\w+)(\*?)', term)
+                                        .group(i) for i in range(1, 4)]
+            parity = parity.replace('*', '^{\circ}')
+            names_tex.append('$' + config + '\ ' + f'^{spin_mul}${L}${parity}_{{{J}}}' + '$')
+        self.tex_names = names_tex
+
     @staticmethod
     def read_states(filter = lambda table: table["n"] <= 4):
         nist_table = pandas.read_csv("atomic data/levels_nist.csv", delimiter=r",", usecols=lambda x: x not in ["Prefix", "Suffix"], dtype=str)
@@ -106,7 +118,7 @@ class Environment:
     T_phot: float = 4400  # K
     M_ejecta: float = 0.04 # solar masses ejected
     mass_fraction: float = 0.002 # mass fraction of helium
-    atomic_mass: float = 4 # atomic mass of helium [u]
+    atomic_mass: float = 88 # atomic mass of helium [u]
     photosphere_velocity: float = 0.245 # photosheric velocity as a fraction of c
     line_velocity: float = 0.245 # velocity of the region to calculate at as a fraction of c
 
@@ -128,6 +140,30 @@ class Environment:
         self.n_He = get_density_profile(self.M_ejecta, self.atomic_mass, self.mass_fraction)(self.line_velocity, self.t_d)
         self.q_dot = 1 * self.t_d**-1.3 # Radiative power of non-thermal electrons
 
+def get_num_density(mass_fraction, env):
+    # needed this to allow treating mass_fraction as a free parameter for fitting
+    return get_density_profile(env.M_ejecta, env.atomic_mass, mass_fraction)(env.line_velocity, env.t_d)
+    
+def pop_to_tau(environment, states, y, A, mass_fraction):
+    n = y.T[-1,:len(states.names)] * get_num_density(mass_fraction, environment) * u.cm**-3
+    eps0 = 1/(4 * np.pi) # i dont like gauss units
+    tau = np.zeros((len(n), len(n)))
+    # The sobolev depth is calculated individually for each transition
+    # Yes i know, loop, very inefficient, but this is a small matrix
+    for i in range(len(n)): 
+        for j in range(len(n)):
+            dE = states.energies[j] - states.energies[i]
+            if dE <= 0:
+                continue
+            lam = dE.to("cm", equivalencies=u.spectral())
+            tau[i,j] = lam**3*eps0 * A[i,j]* u.s**-1 * n[i]/2 * (states.multiplicities[j]/ states.multiplicities[i] - n[j]/n[i]) * (environment.t_d * u.day)
+    # calculate optical depth and escape probability        
+    tau = np.maximum(tau,tau.T)+1e-8
+    #xd = lam**3*eps0 * A[i,j]* u.s**-1 * n[i]/2 * (states.multiplicities[j]/ states.multiplicities[i] - n[j]/n[i]) * (environment.t_d * u.day).to('s')
+    #print('unit of this thing is', xd.unit)
+    return tau
+
+
 # Solves the NLTE equations for the given environment and states
 # The solver uses the sobolev depth method to solve the NLTE equations
 # Iteration works follows:
@@ -144,27 +180,14 @@ def solve_NLTE_sob(environment, states, relaxation_steps = 5):
 
     # perform a few relaxation steps to get the correct sobolev depth
     for _ in range(relaxation_steps):
-        _, y = nlte_solver.solve(1e6)
-        n = y.T[-1,:-2] * u.cm**-3
-        eps0 = 1/(4 * np.pi) # i dont like gauss units
-        tau = np.zeros((len(n), len(n)))
-        # The sobolev depth is calculated individually for each transition
-        # Yes i know, loop, very inefficient, but this is a small matrix
-        for i in range(len(n)): 
-            for j in range(len(n)):
-                dE = states.energies[j] - states.energies[i]
-                if dE <= 0:
-                    continue
-                lam = dE.to("cm", equivalencies=u.spectral())
-                tau[i,j] = lam**3*eps0 * A[i,j]* u.s**-1 * n[i]/2 * (states.multiplicities[j]/ states.multiplicities[i] - n[j]/n[i]) * environment.t_d * u.day
-        # calculate optical depth and escape probability        
-        tau = np.maximum(tau,tau.T)+1e-8
+        _, y = nlte_solver.solve(1e6, A)
+        tau = pop_to_tau(environment, states, y)
         beta = np.array((1-np.exp(-tau)) / tau)
         # adjust the transition rates
         radiative_process.A = A * beta
-        radiative_process.arbsorbtion_rate = absorbtion_rate * beta
+        radiative_process.arbsorbtion_rate =   absorbtion_rate * beta
         radiative_process.stimulated_emission_rate = stimulated_emission_rate * beta
-    return nlte_solver.solve(1e6)[1][:,-1], nlte_solver
+    return tau, nlte_solver.solve(1e6)[1][:,-1], nlte_solver
         
 
 # primary class, contains all the states and processes, and solves the system of differential equations
@@ -195,7 +218,7 @@ class NLTESolver:
         else:   
             solution = solve_ivp(diff_eq, (0, times), 
                                  initial, method="LSODA",  rtol=1e-8, atol=1e-40)
-        return solution.t, solution.y * self.environment.n_He
+        return solution.t, solution.y #* self.environment.n_He only return occupancy, not number density
         
 
 # Handles state -> state transitions due to electron collisions
@@ -231,8 +254,15 @@ class RadiativeProcess:
 
     # calculates the naural decay, arbsorbtion rate and stimulated emission rate
     def get_einstein_rates(self):
+        
+        print("The states are", self.states.names)
+        
         A = get_A_rates(tuple(self.states.names)) * u.s**-1
         E_diff = self.states.energies - self.states.energies[:,np.newaxis]
+        
+        print("The multiplicities are:", self.states.multiplicities)
+        print("Energies:", self.states.energies)
+        
         nu = np.maximum(np.abs(E_diff.to(u.Hz, equivalencies=u.spectral())), 1 * u.Hz)
         F_nu = (2 * consts.h * nu**3) / consts.c**2
         B_stimulation = A / F_nu
@@ -240,6 +270,7 @@ class RadiativeProcess:
         rho_nu = u.sr * self.environment.spectrum(nu)
         stimulation_rate = rho_nu * B_stimulation
         absorbtion_rate = rho_nu * B_absorbtion
+        print("A values", A)
         return A.to("1/s").value, stimulation_rate.to("1/s").value, absorbtion_rate.to("1/s").value
         
 
@@ -291,7 +322,7 @@ class HotElectronIonizationProcess:
         coeff_mat[names.index("HeII"), :len(self.states.names)] = self.environment.q_dot / self.w[0] 
         # coeff_mat[names.index("HeII"), names.index("11S")] = self.environment.q_dot / self.w[0]
         coeff_mat[names.index("HeIII"), names.index("HeII")] = self.environment.q_dot / self.w[1]
-        return coeff_mat 
+        return coeff_mat
 
     
 @lru_cache
@@ -332,16 +363,26 @@ def get_ionization_rates(states, spectrum):
 @lru_cache
 def get_A_table():
     get_n = lambda n, l, count: (int(n)-1)*2 if count else (int(n)-1)
-    nist_table = pandas.read_csv("atomic data/A_rates_NIST.csv", dtype=str)
+    nist_table = pandas.read_csv("atomic_data/SrII_lines_NIST_all.csv", dtype=str)
     nist_table = nist_table.apply(lambda x: x.str.removeprefix("=\"").str.removesuffix("\"") if x.dtype == object else x, axis=1)
     nist_table = nist_table[(nist_table['Aki(s^-1)'] != "")] # drop lines of no interest
-
+    
+    # the above line doesn't get rid of NaNs if has managed to read it in a numeric way 
+    nist_table.dropna(subset=['Aki(s^-1)'], inplace=True) 
     def get_state_name(config_series, term_series):
         n = config_series.str.findall("(\d+)(\w)(2?)").apply(lambda x: str(1+sum([get_n(*nlm) for nlm in x])))
         return n+term_series.str.replace("*", "")
-
-    nist_table["lower_name"] = get_state_name(nist_table["conf_i"], nist_table["term_i"])
-    nist_table["upper_name"] = get_state_name(nist_table["conf_k"], nist_table["term_k"])
+    def get_full_state_name(configs, terms, J):
+        return configs.apply(lambda s: s.split('.')[1]) + ' ' + terms + ' ' + J
+    
+    nist_table['lower_name'] = get_full_state_name(nist_table["conf_i"],
+                                                   nist_table['term_i'],
+                                                   nist_table['J_i'])
+    nist_table['upper_name'] = get_full_state_name(nist_table['conf_k'],
+                                                   nist_table['term_k'],
+                                                   nist_table['J_k'])
+    #nist_table["lower_name"] = get_state_name(nist_table["conf_i"], nist_table["term_i"])
+    #nist_table["upper_name"] = get_state_name(nist_table["conf_k"], nist_table["term_k"])
     nist_table["A_rates"] = pandas.to_numeric(nist_table["Aki(s^-1)"])
     nist_table["g_k"] = pandas.to_numeric(nist_table["g_k"])
     nist_table["g_i"] = pandas.to_numeric(nist_table["g_i"])
@@ -350,12 +391,15 @@ def get_A_table():
 @lru_cache
 def get_A_rates(names):
     nist_table = NLTE.NLTE_model.get_A_table()
+    print("The NIST table read out is:", nist_table)
     A_coefficients = np.zeros((len(names), len(names)))
     for (lower_name, upper_name, _), subtable in nist_table.groupby(["lower_name", "upper_name", "J_i"]):
         if not (lower_name in names and upper_name in names):
+            print(f"No match for {lower_name} -> {upper_name}")
             continue
-
+        
         weighted_A = np.average(subtable["A_rates"], weights = subtable["g_k"])
+        print("Found match for this one, setting A")
         A_coefficients[names.index(lower_name),names.index(upper_name)] += weighted_A
     return A_coefficients
 
