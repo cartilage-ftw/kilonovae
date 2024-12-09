@@ -11,7 +11,7 @@ import NLTE.collision_rates
 import io 
 import re
 import warnings
-
+import matplotlib.pyplot as plt
 
 #################### Hyperparameters: Included atomic levels and physical parameters ####################
 
@@ -170,23 +170,24 @@ def pop_to_tau(environment, states, y, A, mass_fraction):
 # First the NLTE equations are solved assuming optically thin conditions, 
 # then the sobolev depth is calculated, the transition rates are adjusted, and the NLTE equations are solved again
 # These are 
-def solve_NLTE_sob(environment, states, relaxation_steps = 5): 
-    nlte_solver = NLTE.NLTE_model.NLTESolver(environment, states=states)
-    radiative_process = nlte_solver.processes[1]
+def solve_NLTE_sob(environment, states, processes, mass_fraction, relaxation_steps = 5): 
+    nlte_solver = NLTE.NLTE_model.NLTESolver(environment, states=states, processes=processes)
+    # NOTE: use 'isinstance' RadiativeProcess to make it safer, the order is arbitrary
+    radiative_process = processes[0]
     # save the original rates
     A = radiative_process.A 
-    absorbtion_rate = radiative_process.arbsorbtion_rate
+    absorption_rate = radiative_process.arbsorbtion_rate
     stimulated_emission_rate = radiative_process.stimulated_emission_rate
-
+    
     # perform a few relaxation steps to get the correct sobolev depth
     for _ in range(relaxation_steps):
-        _, y = nlte_solver.solve(1e6, A)
-        tau = pop_to_tau(environment, states, y)
+        _, y = nlte_solver.solve(1e6)
+        tau = pop_to_tau(environment, states, y, A, mass_fraction)
         beta = np.array((1-np.exp(-tau)) / tau)
-        # adjust the transition rates
-        radiative_process.A = A * beta
-        radiative_process.arbsorbtion_rate =   absorbtion_rate * beta
-        radiative_process.stimulated_emission_rate = stimulated_emission_rate * beta
+        # adjust the transition rates; I like to do this locally to avoid accidents
+        A = A * beta
+        absorption_rate = absorption_rate * beta
+        stimulated_emission_rate = stimulated_emission_rate * beta
     return tau, nlte_solver.solve(1e6)[1][:,-1], nlte_solver
         
 
