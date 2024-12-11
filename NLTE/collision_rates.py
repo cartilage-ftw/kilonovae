@@ -1,10 +1,77 @@
 from functools import lru_cache, partial
+from fractions import Fraction
 import numpy as np
 import pandas as pd
 import re
+import subprocess
 import astropy.units as u
 import astropy.constants as const
 
+
+# bad code by Aayush
+# NOTE: to be examined for mistakes
+@lru_cache
+def get_effective_strength_mulholland(states, T_e):
+    path = './atomic_data/Mulholland_supplemental_files/srii_lpm_qub.adf04'
+    # table has a convenient two-digit (j,i) index
+    dat = pd.read_csv(path, sep='\s+', skiprows=27, skipfooter=28, index_col=[0,1])
+    # skip the first row with A-value and last row with infinite temperature estimates;
+    # that goes beyond our needs anyways
+    temp_cols = dat.columns[1:-1] # keep this var for easy access later
+    temp_grid = temp_cols.str.replace('+', 'E+').str.replace('-','E-') \
+                    .to_numpy(dtype=float) # table was formatted as 1.00+03 instead of 1.00+E03
+    upsilon_ij_grid = lambda i, j: dat.loc[j,i][temp_cols].apply(lambda x: x.replace('+', 'E+').replace('-', 'E-')).to_numpy(dtype=float)
+    # for a given temperature T
+    upsilon_ij = lambda i, j: np.interp(T_e, temp_grid, upsilon_ij_grid(i, j))
+
+    # nested method, just for readability's sake
+    def fill_coeff_matrix():
+        coeff_matrix = np.zeros(shape=(len(states.all_names), len(states.all_names)))
+        config, term, J = np.array([name.split(' ') for name in states.names]).T
+        # in the mulholland table the parity isn't mentioned; but it's okay for Sr it doesn't matter
+        names_without_parity = [name.replace('*', '') for name in states.names]
+        m24_states = pd.read_csv(path, sep='\s+', skiprows=1, nrows=24, # they calculated values for 24 states
+                                    names=['Index', 'State Label', 'Term Digits', 'Energy (Round)'])
+        full_names_m24 = []
+        for i in range(len(m24_states)):
+            label = m24_states.iloc[i]['State Label']
+            config, term = label.split('(') # e.g. 5s(2S) -> ['5s', '2S)']
+            term = term[:-1] # get rid of the ')'
+            # and the J values
+            J = str(Fraction(m24_states.iloc[i]['Term Digits'].split('(')[-1][:-1]))
+            full_names_m24.append(' '.join([config, term, J]))
+        ## now compute what the coefficients should be
+        T = T_e * u.K
+        g = lambda name: states.multiplicities[names_without_parity.index(name)]
+        # use the energies from the loaded NIST levels, instead of M24 table
+        E = lambda name: states.energies[names_without_parity.index(name)] #* u.eV
+        # The states in Mulholland's tables are labelled (j,i) in a certain order
+        get_m24_idx = lambda name: full_names_m24.index(name)
+        for ii, init in enumerate(names_without_parity):
+            for jj, final in enumerate(names_without_parity):
+                # i, j are indices in the M24 table and NOT the order of loaded NIST levels
+                i = get_m24_idx(init) + 1
+                j = get_m24_idx(final) + 1
+                print(f'{ii}, {jj}')
+                if jj > ii:
+                    print(f'Filling value for {ii}, {jj} [{init}->{final}]; {j}->{i}')
+                    print(f'Found {upsilon_ij(i,j)} for (j,i) -> ({j},{i})')
+                    del_E = E(final) - E(init) # should already be in eV
+                    coeff_matrix[ii, jj] = 8.63E-6/(g(init)*T**0.5).value \
+                                    * upsilon_ij(i, j) \
+                                    * np.exp(-del_E/(const.k_B * T))
+                    coeff_matrix[jj, ii] = g(init)/g(final) \
+                                     * np.exp(del_E/(const.k_B * T).to('eV', equivalencies=u.temperature_energy())) \
+                                     * coeff_matrix[ii, jj]
+        print("---!!!!!----")
+        print("COEFF MATRIX:\n", coeff_matrix)
+        print("----!!!!_-----")
+        return coeff_matrix
+    return fill_coeff_matrix()
+
+# the important thing is, the collision A-value matrix you construct should be the same size and have elements
+# in the order that will be used for bound-bound transitions.
+# NOTE: make sure that all rates were assigned, if not: throw a warning/error
 
 @lru_cache
 def read_effective_collision_strengths_table():
@@ -88,7 +155,6 @@ def get_collision_rates_Ralchenko(states, T):
     sigmas = get_sigmas(states)
     v_to_E = lambda v: 1/2 * const.m_e * v**2
     integrand = lambda v, sigma: electron_v_distibution(v) * v * sigma(v_to_E(v))
-
     rate_matrix = np.zeros((len(states.all_names), len(states.all_names)))
     for (lower,upper), sigma in sigmas.items(): 
         if lower not in states.names or upper not in states.names:

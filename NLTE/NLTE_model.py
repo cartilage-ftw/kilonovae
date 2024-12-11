@@ -20,7 +20,7 @@ import matplotlib.pyplot as plt
 @dataclass 
 class States:
     names : np.array = field(default_factory=lambda: ["11S", "23S", "21S", "23P", "21P", "33S", "31S", "33P", "33D", "31D", "31P"])#, "41S", "41P", "41D", "41F", "43s", "43P", "43D", "43F"])
-    multiplicities : np.array = np.array([1, 3, 1, 9, 3, 3, 1, 9, 15, 5, 3])
+    multiplicities : np.array = field(default_factory=lambda: np.array([1, 3, 1, 9, 3, 3, 1, 9, 15, 5, 3]))
     energies : np.array = np.array([0.00, 19.819614525, 20.615774823, 20.96408688908, 21.2180227112, 22.718466419, 22.920317359, 23.00707314571, 23.07365070854, 23.07407479777, 23.08701852960]) * u.eV
     ionization_species : np.array = field(default_factory=lambda: ["HeII", "HeIII"])
     
@@ -48,7 +48,7 @@ class States:
         return {name: f"$1s{name[0:-2]}{name[-1].lower()}^{name[-2]}{name[-1]}$" for name in self.names} | {"HeII": "$He^{+}$", "HeIII": "$He^{2+}$"}
     
     def texify_names(self):
-        print("existing names are", self.names)
+        #print("existing names are", self.names)
         names_data = pandas.Series(self.names).apply(lambda x: x.split(" "))
         names_tex = []
         for i in range(len(names_data)):
@@ -256,13 +256,13 @@ class RadiativeProcess:
     # calculates the naural decay, arbsorbtion rate and stimulated emission rate
     def get_einstein_rates(self):
         
-        print("The states are", self.states.names)
+        #print("The states are", self.states.names)
         
         A = get_A_rates(tuple(self.states.names)) * u.s**-1
         E_diff = self.states.energies - self.states.energies[:,np.newaxis]
         
-        print("The multiplicities are:", self.states.multiplicities)
-        print("Energies:", self.states.energies)
+        #print("The multiplicities are:", self.states.multiplicities)
+        #print("Energies:", self.states.energies)
         
         nu = np.maximum(np.abs(E_diff.to(u.Hz, equivalencies=u.spectral())), 1 * u.Hz)
         F_nu = (2 * consts.h * nu**3) / consts.c**2
@@ -271,7 +271,7 @@ class RadiativeProcess:
         rho_nu = u.sr * self.environment.spectrum(nu)
         stimulation_rate = rho_nu * B_stimulation
         absorbtion_rate = rho_nu * B_absorbtion
-        print("A values", A)
+        #print("A values", A)
         return A.to("1/s").value, stimulation_rate.to("1/s").value, absorbtion_rate.to("1/s").value
         
 
@@ -392,15 +392,15 @@ def get_A_table():
 @lru_cache
 def get_A_rates(names):
     nist_table = NLTE.NLTE_model.get_A_table()
-    print("The NIST table read out is:", nist_table)
+    #print("The NIST table read out is:", nist_table)
     A_coefficients = np.zeros((len(names), len(names)))
     for (lower_name, upper_name, _), subtable in nist_table.groupby(["lower_name", "upper_name", "J_i"]):
         if not (lower_name in names and upper_name in names):
-            print(f"No match for {lower_name} -> {upper_name}")
+            #print(f"No match for {lower_name} -> {upper_name}")
             continue
         
         weighted_A = np.average(subtable["A_rates"], weights = subtable["g_k"])
-        print("Found match for this one, setting A")
+        #print("Found match for this one, setting A")
         A_coefficients[names.index(lower_name),names.index(upper_name)] += weighted_A
     return A_coefficients
 
