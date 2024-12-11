@@ -1,0 +1,9 @@
+
+python < 3.12 # In Python 3.12 a lot of the escape characterswere cause errors; too lazy to rewrite all regex
+roman # just for handling roman numerals in ionization stage names
+astropy
+scipy
+lmfit
+numpy
+pandas
+matplotlib
