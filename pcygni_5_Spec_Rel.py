@@ -195,7 +195,7 @@ def _S(p, z, vmax, vphot, t, vdet_min, vdet_max, tauref, ve, c, delta):
         #Note the sign is implicit in cos(theta) as z is generically negative towards us
         
         W = _calc_W(r, vmax, vphot, t, vdet_min, vdet_max, tauref, ve) * (delta**2)
-        return W * 1
+        return W * _I(p, z, vmax, vphot, t, vdet_min, vdet_max, tauref, ve)
 
 @numba.njit
 def _I(p, z, vmax, vphot, t, vdet_min, vdet_max, tauref, ve):
@@ -222,7 +222,7 @@ def _I(p, z, vmax, vphot, t, vdet_min, vdet_max, tauref, ve):
 
     if p < vphot*t:
         # in the photosphere plane
-        return 1
+        return 1 # TODO: modify this continuum to a Planck, or user-decided continuum, instead of constant (flat)
     else:
         # above the photosphere plane
         return 0
