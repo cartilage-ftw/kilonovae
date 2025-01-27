@@ -57,14 +57,14 @@ def get_effective_strength_mulholland(states, T_e):
                     print(f'Filling value for {ii}, {jj} [{init}->{final}]; {j}->{i}')
                     print(f'Found {upsilon_ij(i,j)} for (j,i) -> ({j},{i})')
                     del_E = E(final) - E(init) # should already be in eV
-                    coeff_matrix[ii, jj] = 8.63E-6/(g(init)*T**0.5).value \
+                    coeff_matrix[jj, ii] = 8.63E-6/(g(init)*T**0.5).value \
                                     * upsilon_ij(i, j) \
                                     * np.exp(-del_E/(const.k_B * T))
-                    coeff_matrix[jj, ii] = g(init)/g(final) \
-                                     * np.exp(del_E/(const.k_B * T).to('eV', equivalencies=u.temperature_energy())) \
+                    coeff_matrix[ii, jj] = g(init)/g(final) \
+                                     * np.exp(del_E/(const.k_B * T)) \
                                      * coeff_matrix[ii, jj]
         print("---!!!!!----")
-        print("COEFF MATRIX:\n", coeff_matrix)
+        print("COLLISION COEFF MATRIX:\n", coeff_matrix)
         print("----!!!!_-----")
         return coeff_matrix
     return fill_coeff_matrix()

@@ -23,7 +23,7 @@ class States:
     multiplicities : np.array = field(default_factory=lambda: np.array([1, 3, 1, 9, 3, 3, 1, 9, 15, 5, 3]))
     energies : np.array = np.array([0.00, 19.819614525, 20.615774823, 20.96408688908, 21.2180227112, 22.718466419, 22.920317359, 23.00707314571, 23.07365070854, 23.07407479777, 23.08701852960]) * u.eV
     ionization_species : np.array = field(default_factory=lambda: ["HeII", "HeIII"])
-    
+
     def __post_init__(self):
         self.all_names = self.names + self.ionization_species
     
@@ -48,7 +48,7 @@ class States:
         return {name: f"$1s{name[0:-2]}{name[-1].lower()}^{name[-2]}{name[-1]}$" for name in self.names} | {"HeII": "$He^{+}$", "HeIII": "$He^{2+}$"}
     
     def texify_names(self):
-        #print("existing names are", self.names)
+        # for the bound states
         names_data = pandas.Series(self.names).apply(lambda x: x.split(" "))
         names_tex = []
         for i in range(len(names_data)):
@@ -57,6 +57,9 @@ class States:
                                         .group(i) for i in range(1, 4)]
             parity = parity.replace('*', '^{\circ}')
             names_tex.append('$' + config + '\ ' + f'^{spin_mul}${L}${parity}_{{{J}}}' + '$')
+        # TODO: also handle ionization species properly
+        if 'Sr II' in self.ionization_species:
+            names_tex.append(self.ionization_species)
         self.tex_names = names_tex
 
     @staticmethod
@@ -227,23 +230,29 @@ class CollisionProcess:
     def __init__(self, states, environment):
         self.states = states
         self.environment = environment
-        self.collision_rates = self.get_collision_rates()
+        self.collision_rates = self.get_collision_rates() # NOTE: deprecated
         self.name = "Collision"
         
+    # NOTE: deprecated
     def get_collision_rates(self):
         gamma_table, temperatures = NLTE.collision_rates.get_effective_collision_strengths_table_Kington(tuple(self.states.names))
         gamma = interp1d(temperatures, gamma_table, bounds_error=True)(self.environment.T_electrons) 
         E_diff = self.states.energies[:,np.newaxis] - self.states.energies[None,:]
         exponential = np.exp(-np.maximum(E_diff, 0*u.eV) / (consts.k_B * self.environment.T_electrons * u.K))
         return 8.63*10**-6/(np.sqrt(self.environment.T_electrons) * self.states.multiplicities[None,:]) * gamma * exponential
-        
+    
+    #NOTE: deprecated
     def get_transition_rate_matrix_Kingston(self):
         coeff_mat = np.zeros((len(self.states.all_names),len(self.states.all_names)))
         coeff_mat[:len(self.states.names), :len(self.states.names)] = self.collision_rates
         return coeff_mat*self.environment.n_e 
     
     def get_transition_rate_matrix(self):
-        return NLTE.collision_rates.get_collision_rates_Ralchenko(self.states, self.environment.T_electrons)*self.environment.n_e 
+        # different tables for helium and strontium
+        if sum('He' in s for s in self.states.ionization_species) > 0:
+            return NLTE.collision_rates.get_collision_rates_Ralchenko(self.states, self.environment.T_electrons)*self.environment.n_e
+        else: # for strontium
+            return NLTE.collision_rates.get_effective_strength_mulholland(self.states, self.environment.T_electrons)*self.environment.n_e 
     
 # Handles state -> state transitions due to radiative processes (spontaneous emission, stimulated emission and absorption)
 class RadiativeProcess:
@@ -297,11 +306,35 @@ class RecombinationProcess:
     def __init__(self, states, environment):
         self.states = states
         self.environment = environment
-        self.alphaHI = get_HI_recombination_funcs(tuple(states.names))
-        self.alphaHII = get_HII_recombination_func()
+        self.alphaHI = get_HeI_recombination_funcs(tuple(states.names))
+        self.alphaHII = get_HeII_recombination_func()
+        self.alphaHeI_tot = get_total_HeI_recombination_coeff()
+
+        self.alphaSrIII = load_SrIII_recombination_rates()
+        self.alphaSrIV = load_SrIV_recombination_rates()
         self.name = "Recombination"
 
+    def get_rate_matrix_Sr(self):
+        """
+        This is a terribly ugly way of doing this, but it was faster to write this
+        """
+        T = self.environment.T_electrons
+        all_names  = self.states.all_names
+        coeff_mat = np.zeros((len(all_names), len(all_names)))
+        coeff_mat[all_names.index('Sr I'), :len(self.states.names)] \
+                        = self.alphaHeI_tot(np.log10(T)) * self.environment.n_e
+        # NOTE: Currently, the way it's working, it's equally likely to populate any Sr II level (upon recombination)
+        # in a 1:1:1:1 rate
+        coeff_mat[ :len(self.states.names), all_names.index('Sr III')] = \
+              self.alphaSrIII(np.log10(T)) * self.environment.n_e / len(self.states.names)
+        coeff_mat[all_names.index('Sr III'), all_names.index('Sr IV')] = self.alphaSrIV(np.log10(T)) * self.environment.n_e
+        if 'Sr V' in self.states.ionization_species:
+            coeff_mat[all_names.index('Sr IV'), all_names.index('Sr V')] = 5*self.alphaHII(np.log10(T)) * self.environment.n_e
+        return coeff_mat
+
     def get_transition_rate_matrix(self):
+        if 'Sr I' in self.states.ionization_species:
+            return self.get_rate_matrix_Sr()
         coeff_mat = np.zeros((len(self.states.all_names),len(self.states.all_names)))
         T = self.environment.T_electrons
         for name, func in self.alphaHI.items():
@@ -313,17 +346,28 @@ class HotElectronIonizationProcess:
     def __init__(self, states, environment):
         self.states = states
         self.environment = environment
-        self.w = [593, 3076] # work per ionization in eV for HeII and HeIII respectively
+        if 'HeII' in states.ionization_species:
+            self.w = [593, 3076] # work per ionization in eV for HeII and HeIII respectively
+        else:
+            # assume strontium, values as per Tarumi+23
+            self.w = [124, 272, 444, 608, 822]
         self.name = "Non-thermal electrons"
         
     def get_transition_rate_matrix(self):
         coeff_mat = np.zeros((len(self.states.all_names),len(self.states.all_names)))
-        names = self.states.all_names
+        all_names = self.states.all_names
         # TODO: fix back
-        coeff_mat[names.index("HeII"), :len(self.states.names)] = self.environment.q_dot / self.w[0] 
-        # coeff_mat[names.index("HeII"), names.index("11S")] = self.environment.q_dot / self.w[0]
-        coeff_mat[names.index("HeIII"), names.index("HeII")] = self.environment.q_dot / self.w[1]
-        return coeff_mat
+        if 'HeII' in self.states.ionization_species:
+            coeff_mat[all_names.index("HeII"), :len(self.states.names)] = self.environment.q_dot / self.w[0] 
+            # coeff_mat[names.index("HeII"), names.index("11S")] = self.environment.q_dot / self.w[0]
+            coeff_mat[all_names.index("HeIII"), all_names.index("HeII")] = self.environment.q_dot / self.w[1]
+        else:
+            # from Sr I to all bound states of Sr II
+            coeff_mat[ :len(self.states.names), all_names.index('Sr I')] = self.environment.q_dot / self.w[0] 
+            coeff_mat[all_names.index("Sr III"), :len(self.states.names)] = self.environment.q_dot / self.w[1]
+            coeff_mat[all_names.index("Sr IV"), : all_names.index("Sr III")] = self.environment.q_dot / self.w[2]
+            coeff_mat[all_names.index("Sr V"), : all_names.index("Sr IV")] = self.environment.q_dot / self.w[3]
+        return np.array(coeff_mat)
 
     
 @lru_cache
@@ -404,6 +448,20 @@ def get_A_rates(names):
         A_coefficients[names.index(lower_name),names.index(upper_name)] += weighted_A
     return A_coefficients
 
+
+@lru_cache
+def load_SrIII_recombination_rates():
+    # columns = T, DR, RR, RR+DR
+    SrIII_dat = np.loadtxt('./atomic_data/recombination/SrIII-SrII_DR_RR.dat', skiprows=1, delimiter=',')
+    # take the log of the temperature column, because the cross-section (piecewise) scales linearly in log T, not T
+    return interp1d(np.log10(SrIII_dat[:,0]), SrIII_dat[:,3])
+
+@lru_cache
+def load_SrIV_recombination_rates():
+    SrIV_dat = np.loadtxt('./atomic_data/recombination/SrIV-SrIII_DR_RR.dat', skiprows=1, delimiter=',')
+    return interp1d(np.log10(SrIV_dat[:,0]), SrIV_dat[:,3])
+
+
 @lru_cache()
 def load_cross_sections():
     all_states = NLTE.NLTE_model.States.read_states(lambda table: (table["n"] <= 4))
@@ -452,13 +510,13 @@ def get_collision_strengths(select_state_names, T):
 
 # Calculate recombination coefficients
 @lru_cache()
-def get_HII_recombination_func():   
+def get_HeII_recombination_func():   
     return interp1d([3.0, 3.1, 3.2, 3.3, 3.4, 3.5, 3.6, 3.7, 3.8, 3.9, 4.0], 
                     [9.73e-12, 8.42e-12, 7.28e-12, 6.28e-12, 5.42e-12, 4.67e-12, 4.02e-12, 3.46e-12, 2.96e-12, 2.55e-12, 2.18e-12])
 
 # Returns the collision strenths, which should be mutliplied with the electron density to get the rates
-@lru_cache()
-def get_HI_recombination_funcs(select_state_names):
+@lru_cache() 
+def get_HeI_recombination_funcs(select_state_names):
     T, recombination_dict, total_recomb_rate = read_recombination_data()
     subset_dict = {name: data for name, data in recombination_dict.items() if name in select_state_names and name != "11S"}
     subset_sum = sum(subset_dict.values(), T*0)
@@ -467,6 +525,16 @@ def get_HI_recombination_funcs(select_state_names):
     renormalized_dict = {name: interp1d(np.log10(T), data * normalization_coeff) for name, data in subset_dict.items() }
     renormalized_dict["11S"] = interp1d(np.log10(T), ground_coeff)
     return renormalized_dict
+
+# The Bates approximation is actually meant for ..
+# from the electronic configuration (1s2 for He I, 5s2 for Sr I, and similar for the He II <-> Sr II)
+@lru_cache()
+def get_total_HeI_recombination_coeff():
+    # instead of state-specific recombination rates, total-recombination rates are assumed
+    # and we will test the sensitivity to whether entirety the ground or metastables are pop
+    return interp1d(np.linspace(3., 4., 11, endpoint=True), # between 1,000 to 10,000 K
+                        [1.99E-12, 1.71E-12, 1.47E-12, 1.27E-12, 1.09E-12, 9.32E-13,
+                         7.98E-13, 6.84E-13, 5.85E-13, 5.00E-13, 4.28E-13]) # Rates taken from Table IV of Nahar (2010) 
 
 def read_recombination_data():
     with open("atomic data/he1.rrc.ls.txt") as recomb_data:
