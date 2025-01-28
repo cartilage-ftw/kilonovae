@@ -32,7 +32,7 @@ MAX_ENERGY_LEVEL = 25_000.0 # cm-1, corresponds to 400 nm from ground state.
 ionization_stages_names = ['Sr I', 'Sr III', 'Sr IV', 'Sr V']
 
 # strontium mass fraction (not just Sr II, all stages)
-mass_fraction = 0.0002#E3
+mass_fraction = 0.0002 # for initialization, will be fitted later
 
 
 xshooter_dir = './Spectral Series of AT2017gfo/1.43-9.4 - X-shooter/dereddened+deredshifted_spectra/'
@@ -41,12 +41,6 @@ file_names = os.listdir(xshooter_dir)
 # call xshooter_data(1.43) or xshooter_data(1.4) to get the spectrum of t=1.43 days
 xshooter_data = lambda day: np.loadtxt(xshooter_dir + file_names[file_idx(day)])
 # NOTE: This assumes there's only one file with e.g. '+1.43d' in its filename in the dir
-
-blackbody_t = {
-    # t_d: T_obs, T_emit (Lorentz boost corrected)
-    1.43: (5400, 4400),
-	4.40: (3200, 2800)
-}
 
 def get_names(levels_df: pd.DataFrame) -> list:
 	configs = levels_df['Configuration'].apply(lambda s: s.split('.')[1])
@@ -67,15 +61,17 @@ def blackbody_flux(wav0, T, amplitude, z, disable_units=False):
 	return flux
 
 
-def pcygni_interp(wav, v_out, v_phot, tau, resonance_wav, v1=0.22, ve=0.2, t_0=(1.43*u.day).to('s')):
+def pcygni_interp(wav_to_interp_at, v_out, v_phot, tau, resonance_wav, vref=0.22, ve=0.2, t_0=(1.43*u.day).to('s')):
 	wav_grid, pcygni_profile = PcygniCalculator(t=t_0, vmax=v_out * const.c,
-								 vphot=v_phot * const.c, tauref=tau, vref=v1 *
+								 vphot=v_phot * const.c, tauref=tau, vref=vref *
 								 const.c, ve=ve * const.c,
 								 lam0=resonance_wav).calc_profile_Flam(npoints=100)
 	# the PCygni calculator evaluated the profile at certain points it decided
 	# we need to interpolate between these to obtain values we want to plot the profile at
 	interpolator = interp1d(wav_grid, pcygni_profile, bounds_error=False, fill_value=1)
-	return interpolator(wav)
+	return interpolator(wav_to_interp_at)
+
+
 
 def blackbody_with_pycygnis(wavelength_grid, T, taus, line_wavelengths, v_out, v_phot, flux_amp,
 									ve=0.2, occul=1., redshift=0., display=False):
@@ -108,7 +104,7 @@ def blackbody_with_pycygnis(wavelength_grid, T, taus, line_wavelengths, v_out, v
 	return product_profiles*blackbody_flux(wavelength_grid, T=T, amplitude=flux_amp, z=0.)
 
 
-def compute_nlte_opacities(T_electron, T_obs, mass_fraction, t_d, line_wavelengths):
+def compute_nlte_opacities(T_electron, mass_fraction, t_d, line_wavelengths):
 	environment = Environment(T_phot=T_electron, 
 					  photosphere_velocity=0.25,
 					  line_velocity=0.3,
@@ -133,22 +129,6 @@ def compute_nlte_opacities(T_electron, T_obs, mass_fraction, t_d, line_wavelengt
 	return optical_depths
 
 
-'''def fit_blackbody(wavelength, observed_flux, masked_regions):
-	planck_model = Model(blackbody_flux)
-	pars = planck_model.make_params(
-						T=5400,
-						amplitude=np.max(observed_flux)*1E-6, # takes care of units, etc.
-						z=0.,
-						disable_units=True,
-					)
-	mask = np.ones_like(wavelength, dtype=bool)
-	for left, right in masked_regions:
-		mask &= ~((wavelength > left) & (wavelength < right))
-	pars['z'].set(vary=False) # this should be kept constant
-	pars['disable_units'].set(vary=False)
-	fit = planck_model.fit(observed_flux, pars, wav0=wavelength[mask])
-	print('Blackbody Fit Report\n ------\n', fit.fit_report())
-	return fit'''
 
 # NOTE: Loading of the line data happens in NLTE.NLTE_model.py, this is just for states
 def get_strontium_states():
@@ -190,12 +170,13 @@ if __name__ == "__main__":
 	SrII_states = get_strontium_states()
 	SrII_states.texify_names() # TODO: make this get called automatically post-init in NLTE_model.py
 
+	# TODO: allow passing atomic_mass as a parameter to environment; easy switching between He and Sr
 	environment = Environment(T_phot=4400, 
 					  photosphere_velocity=0.25,
 					  line_velocity=0.3,
 					  t_d=1.43)
-
-	solver = NLTESolver(environment=environment,
+	
+	sr_solver = NLTESolver(environment=environment,
 					states=SrII_states,
 					processes=[RadiativeProcess(SrII_states, environment),
 							CollisionProcess(SrII_states, environment),
@@ -203,25 +184,21 @@ if __name__ == "__main__":
 							RecombinationProcess(SrII_states, environment),
 							#PhotoionizationProcess(SrII_states, environment)
 					])
-	 
-	sr_coll_matr = CollisionProcess(SrII_states, environment).get_transition_rate_matrix()
-	recombination_matrix = RecombinationProcess(states=SrII_states, environment=environment).get_transition_rate_matrix()
-	nonthermal_matrix = HotElectronIonizationProcess(SrII_states, environment).get_transition_rate_matrix()
+	
+	get_process = lambda solver, process: [p for p in solver.processes if isinstance(p, process)][0]
+	get_rate_matrix = lambda solver, process: get_process(solver, process).get_transition_rate_matrix()
+
+	sr_coll_matr = get_rate_matrix(sr_solver, CollisionProcess)
+	recombination_matrix = get_rate_matrix(sr_solver, RecombinationProcess)
+	nonthermal_matrix = get_rate_matrix(sr_solver, HotElectronIonizationProcess)
 
 	utils.display_rate_timescale(recombination_matrix, SrII_states.tex_names + ionization_stages_names, 'Recombination')
 	utils.display_rate_timescale(nonthermal_matrix, SrII_states.tex_names + ionization_stages_names, 'Non-thermal Ionization')
 	
-	"""
-	Testing something
-	"""
-	t, n = solver.solve(1e6)
-	'''tau, n, nlte_solver = NLTE.NLTE_model.solve_NLTE_sob(environment,
-										states=SrII_states,
-										processes=solver.processes, #n[:, i:i+1],
-										mass_fraction=mass_fraction)'''
-	# TODO: instead of taking solver.processes[0].A give a better way of returning the A matrix
+	t, n = sr_solver.solve(1e6)
+
 	taus = np.array([NLTE.NLTE_model.pop_to_tau(environment, SrII_states, n[:,i:i+1],
-											 solver.processes[0].A, mass_fraction) for i in range(n.shape[1])])
+											 get_process(sr_solver, RadiativeProcess).A, mass_fraction) for i in range(n.shape[1])])
 	# to pick out the steady state of the differential equation solution, just get the last item
 	tau_final = taus[-1,:,:]
 	optical_depths = []
@@ -269,27 +246,30 @@ if __name__ == "__main__":
 		ax.fill_between(horizontal_grid, flux_max_grid, flux_min_grid, fc='lightgray')
   
 	# now plot the spectra, blackbody + pcygni fits
-	wavelength_grid = np.linspace(2000, 23000, 10_000) * u.AA
+	wavelength_grid = np.linspace(2500, 23000, 10_000) * u.AA
 
-	#blackbody_fit = fit_blackbody(spectrum_dat[:,0], spectrum_dat[:,1], masked_regions=all_masked_regions)
-	amplitude = 1.33E-22
-
-	epochs = [1.43, 2.42, 3.41, 4.4]
+	T_elec_epochs = {1.43: 4400,
+					2.42: 3200,
+					3.41: 2900,
+					4.40: 2800}
+	
 	offsets = np.array([0., -1.5, -2.5, -3.5])*1E-16
-	for i, epoch in enumerate(epochs):
-		colors = mpl.colormaps['Spectral_r'](np.linspace(0, 1.0, len(epochs)))
+
+	for i, (T_e, epoch) in enumerate(T_elec_epochs):
+
+		colors = mpl.colormaps['Spectral_r'](np.linspace(0, 1.0, len(T_elec_epochs)))
 		spec_ep = xshooter_data(day=epoch)
 		# sets the amplitude, etc. of the fitted blackbody
-		ep1_fitted_cont = utils.fit_blackbody(spec_ep[:,0], spec_ep[:,1], all_masked_regions)
+		fitted_cont = utils.fit_blackbody(spec_ep[:,0], spec_ep[:,1], all_masked_regions)
 		# only thing that needs to be tuned is then the mass_fraction
-		#ep1_fitted_line = utils.fit_planck_with_pcygni()
-		T = ep1_fitted_cont.params['T'].value
-		T_sigma = ep1_fitted_cont.params['T'].stderr
-		ax.plot(wavelength_grid, ep1_fitted_cont.eval(wavelength_grid=wavelength_grid) + offsets[i],
+		#fitted_spectral_line = utils.fit_planck_with_pcygni(spec_ep[:,0], spec_ep[:,1], telluric_cutouts_albert)
+		T = fitted_cont.params['T'].value
+		T_sigma = fitted_cont.params['T'].stderr
+		ax.plot(wavelength_grid, fitted_cont.eval(wavelength_grid=wavelength_grid) + offsets[i],
 		  			 ls='--', color='dimgray', #label=f"{T:.2f} $\pm$ {T_sigma:.2f}",
 					   lw=1.,)
-		ax.plot(spec_ep[:,0], spec_ep[:,2] + offsets[i], ls='-', color='darkgray', lw=0.75)
-		ax.plot(spec_ep[:,0], spec_ep[:,1] + offsets[i], ls='-', color=colors[i], lw=0.75,
+		ax.plot(spec_ep[:,0], spec_ep[:,2]/fitted_cont.eval(wavelength_grid=spec_ep[:,0]) - i + offsets[i], ls='-', color='darkgray', lw=0.75)
+		ax.plot(spec_ep[:,0], spec_ep[:,1]/fitted_cont.eval(wavelength_grid=spec_ep[:,0]) - i+ offsets[i], ls='-', color=colors[i], lw=0.75,
 		  				label=f'$t={epoch}$ days')
 	ax.set_ylabel('Flux [erg s$^{-1}$ cm$^{-2}$ $\mathrm{\AA}^{-1}$]')
 	ax.set_xlabel("Wavelength [$\mathrm{\AA}$]")
@@ -318,6 +298,7 @@ if __name__ == "__main__":
 	for i in range(len(SrII_states.names)):
 		axes[1].plot(t, n[i], label=SrII_states.tex_names[i], c=level_colors[i])
 		axes[1].axhline(y=LTE_pops[i], xmin=0, xmax=1, ls='--', c=level_colors[i])
+	axes[1].axhline(y=1, xmin=0, xmax=1, c='k', ls='-')
 	axes[1].set_ylabel('Level Occupancy')
 	
 
