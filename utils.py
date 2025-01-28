@@ -1,9 +1,16 @@
 from lmfit import Model
 from astropy.constants import k_B, h, c
+
 import astropy.constants as const
 import astropy.units as u
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
+
+
+WIENS_CONSTANT = 2898 * u.Unit('um K')
+wiens_law_temperature = lambda wavelength: (WIENS_CONSTANT/wavelength).to('K')
+
 
 def planck_function(wavelength_grid, T, amplitude, z=0.):
     """
@@ -19,11 +26,7 @@ def planck_function(wavelength_grid, T, amplitude, z=0.):
     return flux.to('1e20 * erg s-1 cm-2 AA-1')#.value
 
 
-WIENS_CONSTANT = 2898 * u.Unit('um K')
-wiens_law_temperature = lambda wavelength: (WIENS_CONSTANT/wavelength).to('K')
-
-
-def fit_blackbody(wavelength, flux, masked_regions, z=0.):
+def fit_blackbody(wavelength, flux, masked_regions, z=0., requested_T=None):
     """
     Please make sure the wavelength is in Angstroms
     (even if it's just a scalar and not an astropy.Quantity object)
@@ -45,25 +48,47 @@ def fit_blackbody(wavelength, flux, masked_regions, z=0.):
     if not isinstance(peak_wavelength, u.Quantity):
         peak_wavelength *= u.AA
     T_guess = wiens_law_temperature(peak_wavelength)
-    print('typical values of planck function', planck_function(peak_wavelength, T_guess.value, 1))
-    amp_guess = np.max(flux)/planck_function(peak_wavelength, T_guess.value, 1).value
-    print('Flux guess', amp_guess)
-    pars = blackbody_model.make_params(T=dict(value=T_guess.value,
-                                              min=2000.,
-                                              max=15_000.),
-                                        amplitude=dict(value=amp_guess,
-                                                       min=amp_guess*1E-3,
-                                                       max=amp_guess*1E3),
-                                        z=z)
-    pars['z'].set(vary=False) # the spectra are dereddened already
 
-    # mask out regions to exclude while fitting
+    amp_guess = np.max(flux)/planck_function(peak_wavelength, T_guess.value, 1).value
+    print("Wien temperature guess was", T_guess)
+    pars = blackbody_model.make_params(z=z,
+                T=dict(value=T_guess.value, min=2000., max=15_000.),
+                amplitude=dict(value=amp_guess, min=amp_guess*1E-3, max=amp_guess*1E3))
+
+    pars['z'].set(vary=False) # the spectra are dereddened already
+    if requested_T is not None:
+        pars['T'].set(value=requested_T, vary=False)
+
     mask = np.ones_like(wavelength, dtype=bool)
+    # mask out regions to exclude while fitting
     for left, right in masked_regions:
         mask &= ~((wavelength > left) & (wavelength < right))
-    
-    fitted_blackbody = blackbody_model.fit(flux[mask], params=pars, wavelength_grid=wavelength[mask])
-    return fitted_blackbody
+
+    return blackbody_model.fit(flux[mask], params=pars, wavelength_grid=wavelength[mask],
+                                                method='differential_evolution')
+
+def planck_with_pcygni(blackbody_params):
+    pass
+
+def display_rate_timescale(rate_matrix, all_state_names, process_name):
+    t_matrix = np.reciprocal(rate_matrix)
+
+    fig, ax = plt.subplots(figsize=(6,6))
+    mat = ax.matshow(t_matrix, cmap='plasma_r')
+    ax.set_xticks(np.arange(t_matrix.shape[0]), all_state_names, rotation='vertical')
+    ax.set_yticks(np.arange(t_matrix.shape[0]), all_state_names)
+
+    ax.set_xticks(np.arange(-0.5, t_matrix.shape[0], 1), minor=True)
+    ax.set_yticks(np.arange(-0.5, t_matrix.shape[0], 1), minor=True)
+    ax.grid(which='minor', color='k', linestyle='-', linewidth=0.5)
+
+    plt.colorbar(mat, ax=ax, label=r'$\tau$ [s]')
+    plt.title(f"{process_name} Timescale")
+
+    plt.tight_layout()
+
+    plt.savefig(f"t_{process_name.lower()}.png")
+    plt.show()
 
 telluric_cutouts = np.array([
 		[3000, 4000], # that's an absorption region
@@ -79,7 +104,19 @@ telluric_cutouts = np.array([
 		[17550, 20050] # was 19000
 	])
 
+def load_roederer_pattern():
+    """
+    Returns the r-process template (abudance pattern of the star HD 222925)
+    from Roderer et al. 2022 https://arxiv.org/abs/2205.03426
+    """
+    z_abun_dict = {}
+    return z_abun_dict
+
 if __name__ == "__main__":
+
+    load_roederer_pattern()
+    exit()
+    
     MUSE_SPEC_PATH = './spectra/MUSE/MUSEspec.dat'
 
     spectra_dir = './Spectral Series of AT2017gfo/1.43-9.4 - X-shooter/dereddened+deredshifted_spectra/'
