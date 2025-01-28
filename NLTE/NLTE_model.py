@@ -350,7 +350,7 @@ class HotElectronIonizationProcess:
             self.w = [593, 3076] # work per ionization in eV for HeII and HeIII respectively
         else:
             # assume strontium, values as per Tarumi+23
-            self.w = [124, 272, 444, 608, 822]
+            self.w = np.array([124, 272, 444, 608, 822])
         self.name = "Non-thermal electrons"
         
     def get_transition_rate_matrix(self):
@@ -365,8 +365,8 @@ class HotElectronIonizationProcess:
             # from Sr I to all bound states of Sr II
             coeff_mat[ :len(self.states.names), all_names.index('Sr I')] = self.environment.q_dot / self.w[0] 
             coeff_mat[all_names.index("Sr III"), :len(self.states.names)] = self.environment.q_dot / self.w[1]
-            coeff_mat[all_names.index("Sr IV"), : all_names.index("Sr III")] = self.environment.q_dot / self.w[2]
-            coeff_mat[all_names.index("Sr V"), : all_names.index("Sr IV")] = self.environment.q_dot / self.w[3]
+            coeff_mat[all_names.index("Sr IV"), all_names.index("Sr III")] = self.environment.q_dot / self.w[2]
+            coeff_mat[all_names.index("Sr V"), all_names.index("Sr IV")] = self.environment.q_dot / self.w[3]
         return np.array(coeff_mat)
 
     
