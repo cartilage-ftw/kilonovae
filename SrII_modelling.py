@@ -296,7 +296,7 @@ def load_strontium_line_data():
 	SrII_lines_NIST = SrII_lines_NIST[SrII_lines_NIST['Ek(cm-1)'].astype(float) < MAX_ENERGY_LEVEL]
 
 
-def display_time_evolution(t, n, taus):
+def display_time_evolution(t, level_occupancies, taus):
 	# plot how the optical depth and populations achieve, and the ionization balance
 	
 	fig2, axes = plt.subplots(1, 3, figsize=(15,6))
@@ -311,7 +311,7 @@ def display_time_evolution(t, n, taus):
 	# and for comparison, LTE populations
 	LTE_pops = get_LTE_pops(SrII_states.energies, environment.T_electrons)
 	for i in range(len(SrII_states.names)):
-		axes[1].plot(t, n[i], label=SrII_states.tex_names[i], c=level_colors[i])
+		axes[1].plot(t, level_occupancies[i], label=SrII_states.tex_names[i], c=level_colors[i])
 		axes[1].axhline(y=LTE_pops[i], xmin=0, xmax=1, ls='--', c=level_colors[i])
 	axes[1].axhline(y=1, xmin=0, xmax=1, c='k', ls='-')
 	axes[1].set_ylabel('Level Occupancy')
@@ -319,20 +319,15 @@ def display_time_evolution(t, n, taus):
 
 	#LTE_opacities = NLTE.NLTE_model.pop_to_tau(np.array([LTE_pops]))
 	srII_ion_stages = np.append(
-								[n[:len(SrII_states.names), :].sum(axis=0)], # sum individual Sr II levels for total Sr II
-								n[len(SrII_states.names):, :], # remaining Sr I, III, IV, ..
-						 axis=0) / (environment.n_He)
+								[level_occupancies[:len(SrII_states.names), :].sum(axis=0)], # sum individual Sr II levels for total Sr II
+								level_occupancies[len(SrII_states.names):, :], # remaining Sr I, III, IV, ..
+						 axis=0)
 	ion_stage_names = ['Sr II'] + ionization_stages_names
 	axes[2].set_ylabel("Ionization Fraction")
 	axes[2].set_yscale('log')
-	print("shape of this thing*****")
-	print(srII_ion_stages.shape)
-	print("*****------")
-	print(srII_ion_stages[:,-1])
-	print("sum of ionization stages:", srII_ion_stages[:,-1].sum())
 	ion_stage_colors = mpl.colormaps['plasma'](np.linspace(0, 1, len(ion_stage_names)+1))
 	for i, (ion, name) in enumerate(zip(srII_ion_stages, ion_stage_names)):
-		axes[2].plot(t, srII_ion_stages[i], label=name, c=ion_stage_colors[i])
+		axes[2].plot(t, ion, label=name + f' ({100*ion[-1]:.1f}\%)', c=ion_stage_colors[i])
 	for ax in axes:
 		ax.legend(loc='lower right')
 		ax.set_xlabel("Time")
@@ -366,11 +361,11 @@ if __name__ == "__main__":
 	
 	offsets = np.array([0., -1.5, -2.5, -3.5])*1E-16
 
-	v_outs = [0.42, 0.35, 0.3, 0.3]
-	v_phots = [0.2, 0.15, 0.14, 0.11]
-	ve_s = [0.2] * 4
+	v_outs = [0.42, 0.35, 0.28, 0.25]
+	v_phots = [0.2, 0.13, 0.12, 0.11]
+	ve_s = [0.6] * 4 # ve and v_ref aren't going to change the required mass fraction
 	v_refs = [0.22] * 4
-	mass_fractions = [0.002]*4
+	mass_fractions = [0.0001, 0.0001, 0.0001, 0.0001]
 
 	for i, (epoch, T_e) in enumerate(T_elec_epochs.items()):
 		print("COUNTING!: ", i, epoch, T_e)
@@ -385,10 +380,10 @@ if __name__ == "__main__":
 		
 		environment = Environment(t_d=epoch,
 								T_phot=T_e,
-								mass_fraction=mass_fraction,
+								mass_fraction=mass_fractions[i],
 								atomic_mass=88,
-								photosphere_velocity=0.245,
-								line_velocity=0.245,
+								photosphere_velocity=v_phots[i],
+								line_velocity=v_phots[i],
 								T_electrons=T_e)
 		solver = NLTESolver(environment, SrII_states, processes=
 					  			[RadiativeProcess(SrII_states, environment),
@@ -397,18 +392,12 @@ if __name__ == "__main__":
 								RecombinationProcess(SrII_states, environment),
 								#PhotoionizationProcess(SrII_states, environment)
 						])
-		
-		sr_coll_matr = get_rate_matrix(solver, CollisionProcess)
-
-		recombination_matrix = get_rate_matrix(solver, RecombinationProcess)
-
-		nonthermal_matrix = get_rate_matrix(solver, HotElectronIonizationProcess)
-
-
-
-		utils.display_rate_timescale(recombination_matrix, SrII_states.tex_names + ionization_stages_names, 'Recombination')
-
-		utils.display_rate_timescale(nonthermal_matrix, SrII_states.tex_names + ionization_stages_names, 'Non-thermal Ionization')
+		print(f"Given mass fraction X={mass_fractions[i]}, n_Sr={environment.n_He} at t={epoch}")
+		#sr_coll_matr = get_rate_matrix(solver, CollisionProcess)
+		#recombination_matrix = get_rate_matrix(solver, RecombinationProcess)
+		#nonthermal_matrix = get_rate_matrix(solver, HotElectronIonizationProcess)
+		#utils.display_rate_timescale(recombination_matrix, SrII_states.tex_names + ionization_stages_names, 'Recombination')
+		#utils.display_rate_timescale(nonthermal_matrix, SrII_states.tex_names + ionization_stages_names, 'Non-thermal Ionization')
 
 		# estimate non-LTE atomic populations
 		t, level_occupancy = solver.solve(1e6)
@@ -421,33 +410,33 @@ if __name__ == "__main__":
 		tau_matrices = np.array([
 			NLTE.NLTE_model.pop_to_tau(environment,
 				SrII_states,
-				level_occupancy[:, i:i+1],
+				level_occupancy[:, j:j+1],
 				get_process(solver, RadiativeProcess).A,
-				mass_fraction,
+				mass_fractions[i],
 				)
-			# for each time step
-			for i in range(len(t))
+			# for each time stepß
+			for j in range(len(t))
 		])
 		line_depths, resonance_wavelengths = get_line_depths_wavelengths(tau_matrices[-1], SrII_states)
 		pcygni_line = lambda wav: blackbody_with_pcygnis(wav, line_depths, resonance_wavelengths,
-									  fitted_cont, t_0=(epoch * u.day).to('s'), v_out=v_outs[i], v_phot=v_phots[i])
+									  fitted_cont, t_0=(epoch * u.day).to('s'), v_out=v_outs[i], v_phot=v_phots[i], display=False)
 							   #environment=environment, states=SrII_states, level_occupancy=level_occupancy[:, -2:-1], A_rates=)
 		ax.plot(wavelength_grid, pcygni_line(wavelength_grid) + offsets[i], c='k', ls='-', lw=0.25)
 		ax.fill_between(wavelength_grid.value, pcygni_line(wavelength_grid) + offsets[i],
 				   fitted_cont.eval(wavelength_grid=wavelength_grid) + offsets[i],
-				  			fc='#ebc3d4')
+				  			fc='#ebc3d4', alpha=0.7)
 		#ax.fill_between(spec_ep[:,0], my_choice(spec_ep[:,0]) + offsets[i],spec_ep[:,1] + offsets[i],color='lightpink')
 		#t, n, tau, fitted_spec = fit_pcygnis(spec_ep, sr_solver, environment, epoch=epoch, fitted_planck=fitted_cont,
 		#					wavelength_grid=wavelength_grid, absorption_region=absorption_region)
 
 		ax.plot(wavelength_grid, fitted_cont.eval(wavelength_grid=wavelength_grid) + offsets[i],
-		  			 ls='--', color='dimgray', #label=f"{T:.2f} $\pm$ {T_sigma:.2f}",
-					   lw=1.,)
+		  			 ls='-', color='dimgray', #label=f"{T:.2f} $\pm$ {T_sigma:.2f}",
+					   lw=0.5,)
 		ax.plot(spec_ep[:,0], spec_ep[:,2]+ offsets[i], ls='-', color='darkgray', lw=0.75) #/fitted_cont.eval(wavelength_grid=spec_ep[:,0]) - i 
 		ax.plot(spec_ep[:,0], spec_ep[:,1]+ offsets[i], ls='-', color=colors[i], lw=0.75,
 		  				label=f'$t={epoch}$ days')
-
-		display_time_evolution(t, level_occupancy, tau_matrices)
+		#plt.show()
+		#display_time_evolution(t, environment, level_occupancy, tau_matrices)
 	ax.set_ylabel('Flux [erg s$^{-1}$ cm$^{-2}$ $\mathrm{\AA}^{-1}$]')
 	ax.set_xlabel("Wavelength [$\mathrm{\AA}$]")
 
