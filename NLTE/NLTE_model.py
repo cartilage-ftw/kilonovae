@@ -144,10 +144,14 @@ class Environment:
         self.q_dot = 1 * self.t_d**-1.3 # Radiative power of non-thermal electrons
 
 def get_num_density(mass_fraction, env):
+    n_He = get_density_profile(env.M_ejecta, env.atomic_mass, mass_fraction)(env.line_velocity, env.t_d)
+    if env.n_He != n_He:
+        env.n_He = n_He
     # needed this to allow treating mass_fraction as a free parameter for fitting
-    return get_density_profile(env.M_ejecta, env.atomic_mass, mass_fraction)(env.line_velocity, env.t_d)
+    return n_He
     
 def pop_to_tau(environment, states, y, A, mass_fraction):
+    assert y.T.shape[1] == len(states.all_names)
     n = y.T[-1,:len(states.names)] * get_num_density(mass_fraction, environment) * u.cm**-3
     eps0 = 1/(4 * np.pi) # i dont like gauss units
     tau = np.zeros((len(n), len(n)))
@@ -173,24 +177,23 @@ def pop_to_tau(environment, states, y, A, mass_fraction):
 # First the NLTE equations are solved assuming optically thin conditions, 
 # then the sobolev depth is calculated, the transition rates are adjusted, and the NLTE equations are solved again
 # These are 
-def solve_NLTE_sob(environment, states, processes, mass_fraction, relaxation_steps = 5): 
-    nlte_solver = NLTE.NLTE_model.NLTESolver(environment, states=states, processes=processes)
-    # NOTE: use 'isinstance' RadiativeProcess to make it safer, the order is arbitrary
-    radiative_process = processes[0]
+def solve_NLTE_sob(environment, states, nlte_solver, mass_fraction, relaxation_steps = 2): 
+    get_process = lambda solver, process: [p for p in solver.processes if isinstance(p, process)][0]
+    radiative_process = get_process(nlte_solver, RadiativeProcess)
     # save the original rates
     A = radiative_process.A 
     absorption_rate = radiative_process.arbsorbtion_rate
     stimulated_emission_rate = radiative_process.stimulated_emission_rate
-    
+
     # perform a few relaxation steps to get the correct sobolev depth
     for _ in range(relaxation_steps):
         _, y = nlte_solver.solve(1e6)
-        tau = pop_to_tau(environment, states, y, A, mass_fraction)
+        tau = pop_to_tau(environment, states, y, radiative_process.A, mass_fraction)
         beta = np.array((1-np.exp(-tau)) / tau)
-        # adjust the transition rates; I like to do this locally to avoid accidents
-        A = A * beta
-        absorption_rate = absorption_rate * beta
-        stimulated_emission_rate = stimulated_emission_rate * beta
+        # due to "self-absorption", the effective transition rates are \beta times the true atomic rates
+        radiative_process.A = A * beta
+        radiative_process.absorption_rate = absorption_rate * beta
+        radiative_process.stimulated_emission_rate = stimulated_emission_rate * beta
     return tau, nlte_solver.solve(1e6)[1][:,-1], nlte_solver
         
 
@@ -249,6 +252,7 @@ class CollisionProcess:
     
     def get_transition_rate_matrix(self):
         # different tables for helium and strontium
+        print("-----\nGetting collisionr ates", self.states.ionization_species)
         if sum('He' in s for s in self.states.ionization_species) > 0:
             return NLTE.collision_rates.get_collision_rates_Ralchenko(self.states, self.environment.T_electrons)*self.environment.n_e
         else: # for strontium
@@ -350,7 +354,7 @@ class HotElectronIonizationProcess:
             self.w = [593, 3076] # work per ionization in eV for HeII and HeIII respectively
         else:
             # assume strontium, values as per Tarumi+23
-            self.w = np.array([124, 272, 444, 608, 822])
+            self.w = np.array([124, 272, 444, 608, 822])#*10
         self.name = "Non-thermal electrons"
         
     def get_transition_rate_matrix(self):
