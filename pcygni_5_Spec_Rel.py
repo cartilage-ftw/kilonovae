@@ -145,7 +145,7 @@ def _calc_tau(r, z, vmax, vphot, t, vdet_min, vdet_max, tauref, ve, c):
     #print(corr)
     
     if v >= vdet_min and v <= vdet_max:
-        return corr*tauref * np.exp( - v / ve)
+        return corr*tauref * np.exp((vphot - v)/ve)
     else:
         return np.float32(1e-20)
 
