@@ -223,7 +223,7 @@ class Photosphere:
             tau_i.append(self.tau(line, p, z_arr[order][i], r_arr[order][i], v_arr[order][i]))
             I_scat += S_i(line, p, z_arr[order][i], r_arr[order][i], v_arr[order][i]) * (1-np.exp(-tau_i[i])) * np.exp(-np.sum(tau_i[:i-1]))
         
-        return p * (self.I(p, continuum)*np.exp(-tau_i.sum()) + I_scat)
+        return p * (self.I(p, continuum)*np.exp(-np.sum(tau_i)) + I_scat)
     
     def get_line_mask(self, nu_grid):
         """
