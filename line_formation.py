@@ -60,14 +60,20 @@ def source_function(v, g_u, g_l, n_u_grid, n_l_grid, v_grid, nu_0):
 
 
 @njit(fastmath=True)
-def S(p, z, r, r_min, r_max, v, g_u, g_l, n_u_grid, n_l_grid, v_grid, nu_0, continuum):
+def S(p, z, r, r_min, r_max, v, g_u, g_l, n_u_grid, n_l_grid, v_grid, nu_0, continuum, mode='level-pop'):
 
     outside_photosphere = (r < r_min) | (r > r_max)
     occulted_region = (z < 0) & (p < r_min)
-    return np.where(outside_photosphere | occulted_region,
+    if mode == 'level-pop':
+        # the level populations are given from the NLTE calculation
+        return np.where(outside_photosphere | occulted_region,
+                        1e-10,
+                        source_function(v, g_u, g_l, n_u_grid, n_l_grid, v_grid, nu_0)/(4*np.pi)
+                        )
+    else:
+        return np.where(outside_photosphere | occulted_region,
                     1e-10,
-                    W(r, r_min)*continuum#*4e-19
-                    #source_function(v, g_u, g_l, n_u_grid, n_l_grid, v_grid, nu_0)
+                    W(r, r_min)*continuum
                     )
 
 @dataclass
