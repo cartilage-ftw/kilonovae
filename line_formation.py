@@ -1,3 +1,4 @@
+from synphot.units import convert_flux
 from astropy import units as u
 from astropy.constants import c, h, k_B
 from astropy.modeling.physical_models import BlackBody
@@ -10,8 +11,8 @@ from functools import lru_cache
 
 import matplotlib.pyplot as plt
 import numpy as np
-import time
 import multiprocessing as mp
+import time
 
 """
 Does the PCygni line formation while taking into account the level populations,
@@ -32,11 +33,20 @@ k_B = k_B.cgs.value
 
 
 @njit(fastmath=True)
-def fast_interpolate(x_new, v_grid, y_grid):
+def fast_interpolate(x_new: float, v_grid: np.array, y_grid: np.array):
     """
     A fast interpolation function to be used in the numba-compiled code
     """
-    return np.interp(x_new, v_grid, y_grid)
+    return np.interp(x_new, v_grid, y_grid)#np.where(
+                     #)
+
+
+@njit(fastmath=True)
+def W(r, r_min):
+    """
+    The geometric dilution factor.
+    """
+    return (1 - np.sqrt(1 - (r_min/r)**2)) / 2
 
 
 @njit(fastmath=True)
@@ -47,13 +57,15 @@ def source_function(v, g_u, g_l, n_u_grid, n_l_grid, v_grid, nu_0):
 
 
 @njit(fastmath=True)
-def S(p, z, r, r_min, r_max, v, g_u, g_l, n_u_grid, n_l_grid, v_grid, nu_0):
+def S(p, z, r, r_min, r_max, v, g_u, g_l, n_u_grid, n_l_grid, v_grid, nu_0, continuum):
 
     outside_photosphere = (r < r_min) | (r > r_max)
     occulted_region = (z < 0) & (p < r_min)
     return np.where(outside_photosphere | occulted_region,
-                    1e-20,
-                    source_function(v, g_u, g_l, n_u_grid, n_l_grid, v_grid, nu_0))
+                    1e-10,
+                    W(r, r_min)*continuum#*4e-19
+                    #source_function(v, g_u, g_l, n_u_grid, n_l_grid, v_grid, nu_0)
+                    )
 
 @dataclass
 class LineTransition:
@@ -77,11 +89,11 @@ class LineTransition:
         # compile an interpolation grid for tau, n_upper and n_lower
         #self._n_u_interp = lambda v: fast_interpolate(v, self.velocity_grid, self.n_upper) #interp1d(self.velocity_grid, self.n_upper, kind='linear', bounds_error=False, fill_value='extrapolate')
         #self._n_l_interp = lambda#interp1d(self.velocity_grid, self.n_lower, kind='linear', bounds_error=False, fill_value='extrapolate')
-        #self._tau_interp = #interp1d(self.velocity_grid, self.tau_grid, kind='linear', bounds_error=False, fill_value='extrapolate')
+        self._tau_interp = interp1d(self.velocity_grid, self.tau_grid, kind='linear', bounds_error=False, fill_value=1e-20)
         # later, one can sample from these while integrating.
         self.n_u = lambda v: fast_interpolate(v/c, self.velocity_grid, self.n_upper)#self._n_u_interp(v/c)
         self.n_l = lambda v: fast_interpolate(v/c, self.velocity_grid, self.n_lower)#self._n_l_interp(v/c)
-        self._tau_interp = lambda v: fast_interpolate(v/c, self.velocity_grid, self.tau_grid)
+        #self._tau_interp = lambda v: fast_interpolate(v/c, self.velocity_grid, self.tau_grid)
         #self.tau = lambda v: self._tau_interp(v/c)
     
     #def source_function(self, v):
@@ -106,9 +118,8 @@ def calc_z(p: float, t: float, delta: np.array):
     # the location of the resonance plane
     # includes higher order relativistic corrections as per Hutchsemekers & Surdej
     # I copied the expression from Albert's update
-    z = c*t* (delta**2/(1+delta**2) - delta**2/(1+delta**2) * (1+(1+delta**2)/delta**4*( (1-delta**2-(p/c/t)**2)))**(1/2))
+    z = c*t*(1-delta)#(delta**2/(1+delta**2) - delta**2/(1+delta**2) * (1+(1+delta**2)/delta**4*( (1-delta**2-(p/c/t)**2)))**(1/2))
     return z#.cgs.value
-
 
 
 @dataclass
@@ -134,31 +145,35 @@ class Photosphere:
         self.v_max = self.v_max.to("cm/s").value
         self.t_d = self.t_d.to("s").value
 
-    def tau(self, line, v, r, z):
+        print("Initializing Photosphere for lines", self.line_wavelengths*1e7,"nm")
+    def tau(self, line, p, z, r,v):
         # including the relativistic correction for tau from Hutsemekers & Surdej (1990)
         mu = z / r
         beta = v/c
-        corr = abs( (1-mu*beta)**2 / ( (1-beta)*(mu*(mu-beta) + (1- mu**2)*(1-beta**2)) ) )
+        corr = abs( (1-mu*beta)**2/( (1-beta)*(mu*(mu-beta)+(1-mu**2)*(1-beta**2))) )
+        #print("magnitude of the correction factor", corr)
+        #indices = np.where((corr > 1.5) & (v >= self.v_phot) & (v < self.v_max))[0]
+        #if np.any(indices):
+            #print("Warning: The correction factor is too large", corr[indi], "for v", v[indices & reasonable_v]/c, "and z", z[indices& reasonable_v]/(c*self.t_d), "and r", r[indices& reasonable_v]/(c*self.t_d))
+            #print("Warning: The correction factor is too large", corr[indices], "for v", v[indices]/c, "and z", z[indices]/(c*self.t_d), "and r", r[indices]/(c*self.t_d))
+        outside_photosphere = (r <= self.r_min) | (r > self.r_max)
+        occulted_region = (z < 0) & (p < self.r_min)
+        if ~np.any(occulted_region | outside_photosphere):
+            print("For line", line.wavelength*1e7, "r ", r/(c*self.t_d), "z", z/(c*self.t_d), "p", p/(c*self.t_d), "v", v/c)
+            print("Occulted?", occulted_region, "Outside photosphere?", outside_photosphere)
         tau_ = np.where( 
-                        (v >= self.v_phot) & (v < self.v_max),
+                        outside_photosphere | occulted_region,
+                        1e-15,
                         corr * line._tau_interp((v/c)),
-                        1e-20
                     )
         return tau_
-
-    
-    def W(self, v):
-        """
-        The geometric dilution factor.
-        """
-        return (1 - np.sqrt(1 - (self.v_phot/v)**2)) / 2
     
     
-    def I(self, p, z, nu, continuum):
+    def I(self, p, continuum):
         """
         The incident specific intensity beam
         """
-        return np.where(p < self.r_min, continuum, 0) * c / nu**2
+        return np.where(p < self.v_phot * self.t_d, continuum, 0.)# * c / nu**2
         #    return 0
         #return self.continuum(nu)
 
@@ -189,48 +204,26 @@ class Photosphere:
         #if mode=='two-level-approx':
         #    _S = W(v) * I(p, z, nu)
 
-    def I_emit(self, p: float, nu: float, delta_arr: np.array, continuum: float):
-        # the line summation has to be done in the minus \hat{n} direction (i.e. going inwards
+    def I_emit(self, p:float, nu:float, delta_arr: np.array, continuum: float):
+        z_arr = calc_z(p, self.t_d, delta_arr)
+        r_arr = calc_r(p, z_arr)
+        v_arr = r_arr/self.t_d
+        tau_i = []
+
+        # For the scattering part, the line summation has to be done in the minus \hat{n} direction (i.e. going inwards
         # instead of outwards from observer's line of sight); see eqn (22) of Jeffrey & Branch (1990)
         # to do the ordering, you have to know where the Sobolev resonance plane lies for each particular line
-        t_e = time.time()
-        t_ei = t_e
-        z = calc_z(p, self.t_d, delta_arr)
-        # NOTE: Remember that in cgs units these quantities have values of the order of 10^15
-        #print("Unit of z", z)
-        #print("Unit of p", p)
-        r = calc_r(p, z)
-        v = r/self.t_d#)#.to('m/s')
-        #print("Calculating r,z,v, took", time.time() - t_e)
-        t_e = time.time()
-        #print("value of 'v'", v.to('m/s'))
-        order = np.argsort(z)[::-1]
-        line_transitions = np.array(self.line_list)
-        #print("Sorting took", time.time() - t_e)
-        t_e = time.time()
-        tau_arr = []
-        S_i = lambda line, p, z, r, v: S(p, z, r, self.r_min, self.r_max, v, line.g_upper, line.g_lower, line.n_upper, line.n_lower, line.velocity_grid, line.nu_0)
-        S_ = []
-        for line in line_transitions[order]:
-            tau_arr.append(self.tau(line, v, r, z))
-            S_.append(S_i(line, p,z,r,v))
-        tau_arr = np.array(tau_arr, dtype=float)
-        #print("Interpolating tau took", time.time() - t_e)
-        t_e = time.time()
-
-        I_abs = np.sum(self.I(p, z, nu, continuum)*np.exp(-tau_arr))
-        #print("Calculating I_abs took", time.time() - t_e)
-        t_e = time.time()
-
-        I_line_emit = []
-        for i in range(len(tau_arr)):
-            I_line_emit.append(
-                    S_[i] * (1-np.exp(-tau_arr[i])) * np.exp(-tau_arr[:i-1].sum())
-                        )
-        #print("Calculating I_line_emit took", time.time() - t_e)
-        #print("One step of the integration took", time.time() - t_ei)
-        return p * (I_abs + np.sum(I_line_emit))
+        order = np.argsort(z_arr)[::-1]
         
+        I_scat = 0.
+        # a helper function, because the S function is a bit long
+        S_i = lambda line, p, z, r, v: S(p, z, r, self.r_min, self.r_max, v, line.g_upper, line.g_lower, line.n_upper, line.n_lower, line.velocity_grid, line.nu_0, continuum)  
+        
+        for i, line in enumerate(np.array(self.line_list)[order]):
+            tau_i.append(self.tau(line, p, z_arr[order][i], r_arr[order][i], v_arr[order][i]))
+            I_scat += S_i(line, p, z_arr[order][i], r_arr[order][i], v_arr[order][i]) * (1-np.exp(-tau_i[i])) * np.exp(-np.sum(tau_i[:i-1]))
+        
+        return p * (self.I(p, continuum)*np.exp(-tau_i.sum()) + I_scat)
     
     def get_line_mask(self, nu_grid):
         """
@@ -279,37 +272,53 @@ class Photosphere:
         nu_max = (c/lambda_min)#.to('Hz', equivalencies=u.spectral()).value
 
         nu_grid = np.linspace(nu_min, nu_max, n_points)
-        lamb_grid = 1e7*c/nu_grid
+        lamb_grid = (1e7*c/nu_grid) * u.nm
         Fnu_list = []
         # pre-compute the continuum flux (Planck function)
-        B_nu_grid = self.continuum(nu_grid * u.Hz).cgs.value
+        B_lambda_grid = self.continuum(lamb_grid)#.cgs.value
+        #print("Amplitude of blackbody", self.continuum.scale)
+        #exit()
+        #print("The unit of B_lambda", B_lambda_grid.unit)
+
+        B_nu_grid = convert_flux(lamb_grid, B_lambda_grid, out_flux_unit='erg / (Hz s cm2 sr)').cgs#.value
+        Bnu_cgs_unit = B_nu_grid.unit
+        B_nu_grid = B_nu_grid.value
 
         line_mask = self.get_line_mask(nu_grid)
         # now, calculate the line features
+
         for i, nu in enumerate(nu_grid):
             if line_mask[i]:
-                # if the line is not in the line formation region, just return the continuum
-                Fnu_list.append(B_nu_grid[i])
-                #print("Skipping line formation for lambda", lamb_grid[i])
+                Fnu_list.append(np.pi * self.r_min**2 * B_nu_grid[i])
                 continue
-            delta = nu/self.rest_frequencies#.value
-            print(f"Evaluating flux for lambda={(c*1e7/nu)}")
+            delta = self.rest_frequencies/nu#.value
+            #print(f"Evaluating flux for lambda={(c*1e7/nu)}")
             t_i = time.time()
             p_grid = np.linspace(0, self.r_max, 200)
+            
             I_vals =  np.array([
                 self.I_emit(p, nu, delta, B_nu_grid[i]) for p in p_grid
             ])
             F_nu = 2* np.pi * np.trapz(I_vals, p_grid)
-            #F_nu = 2*np.pi*quad(self.I_emit_wrapper, 0, self.r_max.cgs.value, args=(nu, delta,))[0]
+
+            '''fig, ax = plt.subplots()
+            ax.plot(p_grid/(c*self.t_d), I_vals, label='I_emit')
+            ax.axvline(x=self.r_min/(c*self.t_d), color='red', linestyle='--', label='r_min')
+            ax.axvline(x=self.r_max/(c*self.t_d), color='green', linestyle='--', label='r_max')
+            #ax.plot(p_grid, B_nu_grid[i]*2*np.pi*self.r_min, label=r'$B_{\nu}$')
+            #ax.plot(p_grid, F_nu)
+            plt.show()'''
+            #F_nu = 2*np.pi*quad(self.I_emit, 0, self.r_max, args=(nu, delta, B_nu_grid[i]))[0]
+
+            print("Value of F_nu", F_nu)
             print(f"Time taken: {(time.time() - t_i):.3f} seconds")
             Fnu_list.append(F_nu)
-
-        wavelength_grid = 1e8*(c/(nu_grid))
-        F_lambda = (np.array(Fnu_list) * nu**2 / c)[::-1]
-        # NOTE: F_nu and F_lambda are not the same. F_lambda = F_nu * (c/lambda^2)
-        # F_lambda = F_nu * (c/lambda^2)
-        # do that conversion first, before returning
-        return wavelength_grid, F_lambda
+        #ax.plot(z_grid/(self.t_d * c), tau_vals, label=self.line_wavelengths*1e7)
+        #plt.show()
+        F_lambda = convert_flux(nu_grid * u.Hz, Fnu_list * Bnu_cgs_unit * u.rad**2, out_flux_unit='1e20 erg / (s AA cm2)')# * u.sr
+        wavelength_grid = (lamb_grid).to("AA").value
+        #print("Order of magnitude of F_lambda", np.mean(F_lambda))
+        return wavelength_grid, F_lambda.value/(np.pi*self.r_min**2)
 
 
 if __name__ == "__main__":
