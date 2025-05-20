@@ -24,7 +24,7 @@ Author: Aayush
 """
 
 num_cores = mp.cpu_count()
-#print("Number of CPU cores available", num_cores)
+print("Number of CPU cores available", num_cores)
 
 # I don't like cgs units, but we're doing astronomy so I have to live with it
 c = c.cgs.value
@@ -98,22 +98,11 @@ class LineTransition:
         self.wavelength = self.wavelength.to("cm")#.value
         # compile an interpolation grid for tau, n_upper and n_lower
         # later, one can sample from these while integrating.
-        #self.n_u = lambda v: fast_interpolate(v/c, self.velocity_grid, self.n_upper)
-        #self.n_l = lambda v: fast_interpolate(v/c, self.velocity_grid, self.n_lower)
-        #self._tau_interp_eq = lambda v: fast_interpolate(v/c, self.velocity_grid, self.tau_grid_eq)
-        #self._tau_interp_polar = lambda v: fast_interpolate(v/c, self.velocity_grid, self.tau_grid_polar)
+        self.n_u = lambda v: fast_interpolate(v/c, self.velocity_grid, self.n_upper)
+        self.n_l = lambda v: fast_interpolate(v/c, self.velocity_grid, self.n_lower)
+        self._tau_interp_eq = lambda v: fast_interpolate(v/c, self.velocity_grid, self.tau_grid_eq)
+        self._tau_interp_polar = lambda v: fast_interpolate(v/c, self.velocity_grid, self.tau_grid_polar)
     
-    def n_u(self, v: float) -> float:
-        return fast_interpolate(v/c, self.velocity_grid, self.n_upper)
-
-    def n_l(self, v: float) -> float:
-        return fast_interpolate(v/c, self.velocity_grid, self.n_lower)
-
-    def tau_eq(self, v: float) -> float:
-        return fast_interpolate(v/c, self.velocity_grid, self.tau_grid_eq)
-
-    def tau_polar(self, v: float) -> float:
-        return fast_interpolate(v/c, self.velocity_grid, self.tau_grid_polar)
 
 @njit
 def calc_r(p: float, z: float):
@@ -150,20 +139,6 @@ def is_polar_ejecta(p, z, polar_opening_angle, observer_inclination_angle):
     return np.where((np.abs((np.arctan(p_new/z_new))) < polar_opening_angle/2), 1, 0)
 
 
-def calc_flux_at_nu(photosphere, nu, delta, line_mask, B_nu, p_grid):
-    if line_mask:
-        return np.pi * photosphere.r_min**2 * B_nu
-    
-    #t_i = time.time()
-    I_vals =  np.array([
-        photosphere.I_emit(p, nu, delta, B_nu) for p in p_grid
-    ])
-    F_nu = 2* np.pi * np.trapz(I_vals, p_grid)
-    #F_nu = 2*np.pi*quad(self.I_emit, 0, self.r_max, args=(nu, delta, B_nu_grid[i]))[0]
-    #print("Value of F_nu", F_nu)
-    return F_nu
-
-
 @dataclass
 class Photosphere:
     """
@@ -189,6 +164,26 @@ class Photosphere:
         self.v_max = self.v_max.to("cm/s").value
         self.t_d = self.t_d.to("s").value
         print("Initializing Photosphere for lines", self.line_wavelengths*1e7,"nm")
+    
+    def plot_polar(self):
+        fig, ax = plt.subplots()
+        v_phot_circle = plt.Circle((0, 0), self.r_min, ec='w',ls='--', fill=False, alpha=1)
+        v_max_circle = plt.Circle((0, 0), self.r_max, ec='w', ls=':', fill=False, alpha=1)
+        p_list = np.linspace(-self.v_max/c, self.v_max/c, 500)
+        z_list = np.linspace(-self.v_max/c, self.v_max/c, 500)#/(c*self.t_d)
+        z_0 = np.zeros_like(p_list)# * self.r_max#/(c*self.t_d)
+        z_grid, p_grid = np.meshgrid(z_list, p_list)#/(c*self.t_d)
+        is_polar = is_polar_ejecta(p_grid, z_grid, self.polar_opening_angle, self.observer_angle)
+        pos = ax.imshow(is_polar, extent=(-self.r_max, self.r_max, -self.r_max, self.r_max), 
+                        cmap='coolwarm_r', origin='lower')
+        fig.colorbar(pos, ax=ax,label='Polar Ejecta')
+        ax.add_artist(v_phot_circle)
+        ax.add_artist(v_max_circle)
+
+        ax.plot(p_list, z_0, c='k', lw=0.5, ls='--')
+        ax.set_xlabel("p (cm)")
+        ax.set_ylabel("z (cm)")
+        plt.show()
 
 
     def tau(self, line, p, z, r,v):
@@ -199,13 +194,12 @@ class Photosphere:
 
         # decide between polar and equatorial ejecta
         tau_ = np.where(is_polar_ejecta(p,z, self.polar_opening_angle, self.observer_angle),
-                 corr*line.tau_polar((v/c)),
-                 corr*line.tau_eq((v/c))
+                 corr*line._tau_interp_polar((v/c)),
+                 corr*line._tau_interp_eq((v/c))
                  )
-        # deciee if the point is outside the line forming region
+
         outside_photosphere = (r <= self.r_min) | (r > self.r_max)
         occulted_region = (z < 0) & (p < self.r_min)
-
         return np.where( 
                         outside_photosphere | occulted_region,
                         1e-15,
@@ -242,38 +236,6 @@ class Photosphere:
         
         return p * (self.I(p, continuum)*np.exp(-np.sum(tau_i)) + I_scat)
     
-
-    def visualize_polar_region(self):
-        """
-        Useful for visualizing the polar ejecta region
-        to see if the inclination is what I think it is.
-        """
-        fig, ax = plt.subplots()
-        v_phot_circle = plt.Circle((0, 0), self.v_phot/c, ec='w',ls='--', fill=False, alpha=1)
-        v_max_circle = plt.Circle((0, 0), self.v_max/c, ec='w', ls=':', fill=False, alpha=1)
-        p_list = np.linspace(-self.v_max/c, self.v_max/c, 500)
-        z_list = np.linspace(-self.v_max/c, self.v_max/c, 500)#/(c*self.t_d)
-        z_0 = np.zeros_like(p_list)# * self.r_max#/(c*self.t_d)
-        z_grid, p_grid = np.meshgrid(z_list, p_list)#/(c*self.t_d)
-
-        r_grid = calc_r(p_grid, z_grid)
-        is_polar = is_polar_ejecta(p_grid, z_grid, self.polar_opening_angle, self.observer_angle)
-        is_polar &= (r_grid < self.r_max/(c*self.t_d))
-        pos = ax.imshow(is_polar, extent=(-self.v_max/c, self.v_max/c, -self.v_max/c, self.v_max/c), 
-                        cmap='coolwarm_r', origin='lower')
-        fig.colorbar(pos, ax=ax,label='Polar Ejecta')
-        ax.add_artist(v_phot_circle)
-        ax.add_artist(v_max_circle)
-
-        ax.plot(p_list, z_0, c='w', lw=1, ls='--')
-        ax.text(0.7*self.v_phot/c, 0.02, s=r'$\to$', va='center', ha='center', color='w')
-        ax.set_xlabel("p (c)")
-        ax.set_ylabel("z (c)")
-        plt.tight_layout()
-        ax.set_aspect('equal')
-        plt.show()
-
-
     def get_line_mask(self, nu_grid):
         """
         There are parts of the spectrum where there are no lines
@@ -299,9 +261,9 @@ class Photosphere:
             #         s=f"{c*1e7/self.rest_frequencies[i]:.2f}", fontsize=11)
         #plt.show()
         return ~mask
+    
 
-
-    def calc_spectrum(self, start_wav=3_500*u.AA, end_wav=22_500*u.AA, n_points=2000):
+    def calc_spectrum(self, start_wav=3_500*u.AA, end_wav=22_500*u.AA, n_points=200):
         """
         I was thinking, if I pass v_phot and v_max here that can be used for a fitting routine
         it can be used to update v_phot and v_max set in the Photosphere object
@@ -330,18 +292,29 @@ class Photosphere:
 
         # In a lot of the spectrum, there may not be any opacity to cause absorption/emission
         # in those parts, just return the continuum. This mask is used to decide that.
-        line_masks = self.get_line_mask(nu_grid)
+        line_mask = self.get_line_mask(nu_grid)
 
-        p_grid = np.linspace(0, self.r_max, 200)
-        t_i = time.time()
-        with mp.Pool(num_cores) as pool:
-            params_all_Fnu_calc = []
-            for i, nu in enumerate(nu_grid):
-                delta = nu/self.rest_frequencies
-                params_all_Fnu_calc.append((self, nu, delta, line_masks[i], B_nu_grid[i], p_grid))
-            Fnu_list = pool.starmap(calc_flux_at_nu, params_all_Fnu_calc)
-                #Fnu_list.append(pool.map(calc_flux_at_nu(nu, delta, line_masks[i], B_nu_grid[i], p_grid)))
-        print(f"Time taken: {(time.time() - t_i):.3f} seconds for full spectrum calculation")
+        
+        for i, nu in enumerate(nu_grid):
+            if line_mask[i]:
+                Fnu_list.append(np.pi * self.r_min**2 * B_nu_grid[i])
+                continue
+            
+            delta = nu/self.rest_frequencies
+            
+            t_i = time.time()
+
+            p_grid = np.linspace(0, self.r_max, 200)
+            I_vals =  np.array([
+                self.I_emit(p, nu, delta, B_nu_grid[i]) for p in p_grid
+            ])
+            F_nu = 2* np.pi * np.trapz(I_vals, p_grid)
+            #F_nu = 2*np.pi*quad(self.I_emit, 0, self.r_max, args=(nu, delta, B_nu_grid[i]))[0]
+
+            print("Value of F_nu", F_nu)
+            print(f"Time taken: {(time.time() - t_i):.3f} seconds")
+            Fnu_list.append(F_nu)
+
         F_lambda = convert_flux(nu_grid * u.Hz, Fnu_list * Bnu_cgs_unit * u.rad**2, out_flux_unit='1e20 erg / (s AA cm2)')# * u.sr
         wavelength_grid = (lamb_grid).to("AA").value
         return wavelength_grid, F_lambda.value/(np.pi*self.r_min**2)
