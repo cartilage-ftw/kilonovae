@@ -124,6 +124,19 @@ def calc_z(p: float, t: float, delta: np.array):
     return z
 
 
+@njit(fastmath=True)
+def check_polar_opening(p, z, polar_opening_angle, observer_angle):
+    """
+    For implementing the two-component model, check if the point (p, z)
+    is within the "polar" ejecta region or not.
+    Also takes into account an observer's inclination angle
+    """
+    beta = observer_angle
+    p_new = p * np.cos(beta) + z * np.sin(beta)
+    z_new = -p * np.sin(beta) + z * np.cos(beta)
+    return np.where((np.abs((np.arctan(p_new/z_new))) < polar_opening_angle/2), 1, 0)
+
+
 @dataclass
 class Photosphere:
     """
@@ -137,7 +150,8 @@ class Photosphere:
                         # what instead we need to worry about are more general forms of the source function/emissivity
                         # including the non-scattering contribution G(r), etc.
     line_list: list[LineTransition]
-
+    polar_opening_angle: float = np.pi/4
+    observer_angle: float = np.pi/6
 
     def __post_init__(self):
         self.r_max = (self.v_max * self.t_d).to("cm").value
@@ -147,10 +161,29 @@ class Photosphere:
         self.v_phot = self.v_phot.to("cm/s").value
         self.v_max = self.v_max.to("cm/s").value
         self.t_d = self.t_d.to("s").value
-
+        self.tan_theta = np.tan(self.polar_opening_angle)
         print("Initializing Photosphere for lines", self.line_wavelengths*1e7,"nm")
     
-    
+    def plot_polar(self):
+        fig, ax = plt.subplots()
+        v_phot_circle = plt.Circle((0, 0), self.r_min, ec='w',ls='--', fill=False, alpha=1)
+        v_max_circle = plt.Circle((0, 0), self.r_max, ec='w', ls=':', fill=False, alpha=1)
+        p_list = np.linspace(-self.v_max/c, self.v_max/c, 500)
+        z_list = np.linspace(-self.v_max/c, self.v_max/c, 500)#/(c*self.t_d)
+        z_0 = np.zeros_like(p_list)# * self.r_max#/(c*self.t_d)
+        z_grid, p_grid = np.meshgrid(z_list, p_list)#/(c*self.t_d)
+        is_polar = check_polar_opening(p_grid, z_grid, self.polar_opening_angle, self.observer_angle)
+        pos = ax.imshow(is_polar, extent=(-self.r_max, self.r_max, -self.r_max, self.r_max), 
+                        cmap='coolwarm_r', origin='lower')
+        fig.colorbar(pos, ax=ax,label='Polar Ejecta')
+        ax.add_artist(v_phot_circle)
+        ax.add_artist(v_max_circle)
+
+        ax.plot(p_list, z_0, c='k', lw=0.5, ls='--')
+        ax.set_xlabel("p (cm)")
+        ax.set_ylabel("z (cm)")
+        plt.show()
+
     def tau(self, line, p, z, r,v):
         # including the relativistic correction for tau from Hutsemekers & Surdej (1990)
         mu = z / r
@@ -252,8 +285,8 @@ class Photosphere:
         # In a lot of the spectrum, there may not be any opacity to cause absorption/emission
         # in those parts, just return the continuum. This mask is used to decide that.
         line_mask = self.get_line_mask(nu_grid)
+
         
-        # now, to the spectrum calculation
         for i, nu in enumerate(nu_grid):
             if line_mask[i]:
                 Fnu_list.append(np.pi * self.r_min**2 * B_nu_grid[i])
