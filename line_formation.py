@@ -85,7 +85,8 @@ class LineTransition:
     When tau is needed for a specific r (or v), it returns the value by interpolating.
     """
     wavelength: Quantity
-    tau_grid: np.ndarray # shape same as len(velocity_grid)
+    tau_grid_eq: np.ndarray # shape same as len(velocity_grid)
+    tau_grid_polar: np.ndarray
     velocity_grid: np.ndarray # in units of 'c'
     g_upper: int
     g_lower: int
@@ -99,7 +100,8 @@ class LineTransition:
         # later, one can sample from these while integrating.
         self.n_u = lambda v: fast_interpolate(v/c, self.velocity_grid, self.n_upper)
         self.n_l = lambda v: fast_interpolate(v/c, self.velocity_grid, self.n_lower)
-        self._tau_interp = lambda v: fast_interpolate(v/c, self.velocity_grid, self.tau_grid)
+        self._tau_interp_eq = lambda v: fast_interpolate(v/c, self.velocity_grid, self.tau_grid_eq)
+        self._tau_interp_polar = lambda v: fast_interpolate(v/c, self.velocity_grid, self.tau_grid_polar)
     
 
 @njit
@@ -125,13 +127,13 @@ def calc_z(p: float, t: float, delta: np.array):
 
 
 @njit(fastmath=True)
-def check_polar_opening(p, z, polar_opening_angle, observer_angle):
+def is_polar_ejecta(p, z, polar_opening_angle, observer_inclination_angle):
     """
     For implementing the two-component model, check if the point (p, z)
     is within the "polar" ejecta region or not.
     Also takes into account an observer's inclination angle
     """
-    beta = observer_angle
+    beta = observer_inclination_angle
     p_new = p * np.cos(beta) + z * np.sin(beta)
     z_new = -p * np.sin(beta) + z * np.cos(beta)
     return np.where((np.abs((np.arctan(p_new/z_new))) < polar_opening_angle/2), 1, 0)
@@ -151,7 +153,7 @@ class Photosphere:
                         # including the non-scattering contribution G(r), etc.
     line_list: list[LineTransition]
     polar_opening_angle: float = np.pi/4
-    observer_angle: float = np.pi/6
+    observer_angle: float = np.pi/2
 
     def __post_init__(self):
         self.r_max = (self.v_max * self.t_d).to("cm").value
@@ -161,7 +163,6 @@ class Photosphere:
         self.v_phot = self.v_phot.to("cm/s").value
         self.v_max = self.v_max.to("cm/s").value
         self.t_d = self.t_d.to("s").value
-        self.tan_theta = np.tan(self.polar_opening_angle)
         print("Initializing Photosphere for lines", self.line_wavelengths*1e7,"nm")
     
     def plot_polar(self):
@@ -172,7 +173,7 @@ class Photosphere:
         z_list = np.linspace(-self.v_max/c, self.v_max/c, 500)#/(c*self.t_d)
         z_0 = np.zeros_like(p_list)# * self.r_max#/(c*self.t_d)
         z_grid, p_grid = np.meshgrid(z_list, p_list)#/(c*self.t_d)
-        is_polar = check_polar_opening(p_grid, z_grid, self.polar_opening_angle, self.observer_angle)
+        is_polar = is_polar_ejecta(p_grid, z_grid, self.polar_opening_angle, self.observer_angle)
         pos = ax.imshow(is_polar, extent=(-self.r_max, self.r_max, -self.r_max, self.r_max), 
                         cmap='coolwarm_r', origin='lower')
         fig.colorbar(pos, ax=ax,label='Polar Ejecta')
@@ -184,18 +185,25 @@ class Photosphere:
         ax.set_ylabel("z (cm)")
         plt.show()
 
+
     def tau(self, line, p, z, r,v):
         # including the relativistic correction for tau from Hutsemekers & Surdej (1990)
         mu = z / r
         beta = v/c
         corr = abs( (1-mu*beta)**2/( (1-beta)*(mu*(mu-beta)+(1-mu**2)*(1-beta**2))) )
 
+        # decide between polar and equatorial ejecta
+        tau_ = np.where(is_polar_ejecta(p,z, self.polar_opening_angle, self.observer_angle),
+                 corr*line._tau_interp_polar((v/c)),
+                 corr*line._tau_interp_eq((v/c))
+                 )
+
         outside_photosphere = (r <= self.r_min) | (r > self.r_max)
         occulted_region = (z < 0) & (p < self.r_min)
         return np.where( 
                         outside_photosphere | occulted_region,
                         1e-15,
-                        corr * line._tau_interp((v/c)),
+                        tau_,
                     )
     
     
