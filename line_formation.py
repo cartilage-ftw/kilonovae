@@ -1,4 +1,5 @@
 from numba import njit
+from pathos.multiprocessing import ProcessingPool
 from synphot.units import convert_flux
 from astropy.constants import c, h, k_B
 from astropy.modeling.physical_models import BlackBody
@@ -6,10 +7,10 @@ from astropy.units import Quantity
 from scipy.integrate import quad
 from scipy.interpolate import interp1d
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import lru_cache, partial
 
-import astropy.units as u
 import multiprocessing as mp
+import astropy.units as u
 import numpy as np
 import matplotlib.pyplot as plt
 import time
@@ -165,7 +166,8 @@ class Photosphere:
         self.t_d = self.t_d.to("s").value
         print("Initializing Photosphere for lines", self.line_wavelengths*1e7,"nm")
     
-    def plot_polar(self):
+
+    def visualize_polar_region(self):
         fig, ax = plt.subplots()
         v_phot_circle = plt.Circle((0, 0), self.r_min, ec='w',ls='--', fill=False, alpha=1)
         v_max_circle = plt.Circle((0, 0), self.r_max, ec='w', ls=':', fill=False, alpha=1)
@@ -263,6 +265,19 @@ class Photosphere:
         return ~mask
     
 
+    def calc_flux_at_nu(self, nu, delta, line_mask, B_nu, p_grid):
+        if line_mask:
+            return np.pi * self.r_min**2 * B_nu
+        
+        #t_i = time.time()
+        I_vals =  np.array([
+            self.I_emit(p, nu, delta, B_nu) for p in p_grid
+        ])
+        F_nu = 2* np.pi * np.trapz(I_vals, p_grid)
+        #F_nu = 2*np.pi*quad(self.I_emit, 0, self.r_max, args=(nu, delta, B_nu_grid[i]))[0]
+        #print("Value of F_nu", F_nu)
+        return F_nu
+
     def calc_spectrum(self, start_wav=3_500*u.AA, end_wav=22_500*u.AA, n_points=200):
         """
         I was thinking, if I pass v_phot and v_max here that can be used for a fitting routine
@@ -289,31 +304,22 @@ class Photosphere:
         Bnu_cgs_unit = B_nu_grid.unit
         B_nu_grid = B_nu_grid.value
 
-
         # In a lot of the spectrum, there may not be any opacity to cause absorption/emission
         # in those parts, just return the continuum. This mask is used to decide that.
-        line_mask = self.get_line_mask(nu_grid)
+        line_masks = self.get_line_mask(nu_grid)
 
+        p_grid = np.linspace(0, self.r_max, 200)
+
+        params = [
+            (nu, nu/self.rest_frequencies, line_masks[i], B_nu_grid[i], p_grid)
+            for i, nu in enumerate(nu_grid)
+        ]
+
+        t_i = time.time()
+        with ProcessingPool(num_cores) as pool:
+            Fnu_list = pool.map(lambda args: self.calc_flux_at_nu(*args), params)
         
-        for i, nu in enumerate(nu_grid):
-            if line_mask[i]:
-                Fnu_list.append(np.pi * self.r_min**2 * B_nu_grid[i])
-                continue
-            
-            delta = nu/self.rest_frequencies
-            
-            t_i = time.time()
-
-            p_grid = np.linspace(0, self.r_max, 200)
-            I_vals =  np.array([
-                self.I_emit(p, nu, delta, B_nu_grid[i]) for p in p_grid
-            ])
-            F_nu = 2* np.pi * np.trapz(I_vals, p_grid)
-            #F_nu = 2*np.pi*quad(self.I_emit, 0, self.r_max, args=(nu, delta, B_nu_grid[i]))[0]
-
-            print("Value of F_nu", F_nu)
-            print(f"Time taken: {(time.time() - t_i):.3f} seconds")
-            Fnu_list.append(F_nu)
+        print(f"Time taken: {(time.time() - t_i):.3f} seconds for full spectrum calculation")
 
         F_lambda = convert_flux(nu_grid * u.Hz, Fnu_list * Bnu_cgs_unit * u.rad**2, out_flux_unit='1e20 erg / (s AA cm2)')# * u.sr
         wavelength_grid = (lamb_grid).to("AA").value
