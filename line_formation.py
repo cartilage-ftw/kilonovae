@@ -1,4 +1,3 @@
-from jax.sharding import Mesh, PartitionSpec
 from synphot.units import convert_flux
 from astropy.constants import c, h, k_B
 from astropy.modeling.physical_models import BlackBody
@@ -25,6 +24,8 @@ Author: Aayush
 """
 
 num_cores = mp.cpu_count()
+# There isn't any point in it using GPU when there aren't enough points to calculate.
+jax.config.update('jax_platform_name', 'cpu')
 jax.config.update('jax_num_cpu_devices', num_cores)
 print("Number of CPU cores available", jax.device_count())
 
@@ -87,7 +88,7 @@ class LineTransition:
 
     When tau is needed for a specific r (or v), it returns the value by interpolating.
     """
-    wavelength: Quantity
+    wavelength: float
     tau_grid_eq: np.ndarray # shape same as len(velocity_grid)
     tau_grid_polar: np.ndarray
     velocity_grid: np.ndarray # in units of 'c'
@@ -141,29 +142,15 @@ def is_polar_ejecta(p, z, polar_opening_angle, observer_inclination_angle):
     return jnp.where((jnp.abs((jnp.arctan(p_new/z_new))) < polar_opening_angle/2), 1, 0)
 
 @jax.jit
-def tau_global(self, line, p, z, r,v, t_d, v_phot, v_max, polar_opening_angle, observer_angle):
-    # including the relativistic correction for tau from Hutsemekers & Surdej (1990)
-    mu = z / r
-    beta = v/c
-    corr = abs( (1-mu*beta)**2/( (1-beta)*(mu*(mu-beta)+(1-mu**2)*(1-beta**2))) )
-
-    # decide between polar and equatorial ejecta
-    tau_ = np.where(is_polar_ejecta(p,z, polar_opening_angle, observer_angle),
-                corr*line._tau_interp_polar((v/c)),
-                corr*line._tau_interp_eq((v/c))
-                )
-
-    outside_photosphere = (r <= v_phot*t_d) | (r > v_max*t_d)
-    occulted_region = (z < 0) & (p < self.r_min)
-    return np.where( 
-                    outside_photosphere | occulted_region,
-                    1e-15,
-                    tau_,
-                )
-
+def I(p, continuum, r_min):
+    """
+    The incident specific intensity beam
+    """
+    return jnp.where(p < r_min, continuum, 0.)
+    
 @partial(jax.tree_util.register_dataclass, 
-         data_fields=['polar_opening_angle', 'observer_angle'],
-         meta_fields=['v_phot', 'v_max', 't_d', 'continuum', 'line_list'])
+         data_fields=['polar_opening_angle', 'observer_angle', 'v_phot', 'v_max', 't_d'],
+         meta_fields=['continuum', 'line_list'])
 @dataclass
 class Photosphere:
     """
@@ -235,13 +222,6 @@ class Photosphere:
                             1e-15,
                             tau_,
                         )
-    
-    @jax.jit
-    def I(self, p, continuum):
-        """
-        The incident specific intensity beam
-        """
-        return jnp.where(p < (self.v_phot*self.t_d), continuum, 0.)
 
 
     @jax.jit
@@ -259,44 +239,39 @@ class Photosphere:
         
         tau_i = jnp.zeros_like(z_arr)
         _Si = jnp.zeros_like(z_arr)
-
+        
         for i, line in enumerate(self.line_list):
             tau_i = tau_i.at[i].set(self.tau(line, p, z_arr[i], r_arr[i], v_arr[i]))
             _Si = _Si.at[i].set(S_i(line, p, z_arr[i], r_arr[i], v_arr[i]))
         
         tau_i = jnp.array(tau_i)[order]
         _Si = jnp.array(_Si)[order]
-
-        I_scat = 0.
-        for i in range(len(tau_i)):
-            I_scat += _Si[i] * (1-jnp.exp(-tau_i[i])) * jnp.exp(-np.sum(tau_i[:i-1]))
         
-        return p * (self.I(p, continuum)*jnp.exp(-jnp.sum(tau_i)) + I_scat)
+        I_scat = jnp.sum(_Si * (1 - jnp.exp(-tau_i)) * jnp.exp(-jnp.cumsum(tau_i) + tau_i))
+        tau_tot = jnp.sum(tau_i)
+        I_abs = I(p, continuum, self.r_min)*jnp.exp(-tau_tot)
+        _Iemit = I_abs + I_scat
+        return p * _Iemit
 
 
     @jax.jit
     def calc_Fnu(self, nu: float, delta_arr: np.array, line_mask: np.array, p_grid: np.array, B_nu: float):
-        #if line_mask:
-        #    return (2*np.pi*self.r_min**2)* B_nu
-        #$else:
         F_continuum = jnp.pi * self.r_min**2 * B_nu
         def line_flux():
             I_vals = jax.vmap(lambda p: self.I_emit(p, delta_arr, B_nu))(p_grid)
             return 2*np.pi* jnp.trapezoid(I_vals, p_grid)
-        return jnp.where(line_mask, line_flux(), F_continuum)
+        return jnp.where(line_mask, F_continuum, line_flux())
 
 
-    @jax.jit
-    def _calc_Fnu_list(self, nu_grid, line_masks, B_nu_grid, p_grid):
-        #mesh = Mesh(jax.devices(), ('x',))
+    def calc_spectral_flux(self, nu_grid, line_masks, B_nu_grid, p_grid):
         delta_arr = nu_grid[:, None] / jnp.array(self.rest_frequencies)[None,:]
         calc_one = lambda nu, delta, line_mask, B: self.calc_Fnu(nu, delta, line_mask,  p_grid, B)
-        '''Fnu_list = jax.shard_map(calc_one, mesh=mesh,
-                                    in_specs=(PartitionSpec('x'),
-                                              PartitionSpec('x', None),
-                                              PartitionSpec('x'),
-                                              PartitionSpec('x')),
-                                    out_specs=PartitionSpec('x'))(nu_grid, delta_arr, line_masks, B_nu_grid)'''
+        #params = [
+        #    (nu, nu/self.rest_frequencies, line_masks[i], B_nu_grid[i], p_grid)
+        #    for i, nu in enumerate(nu_grid)
+        #]
+        #with ProcessingPool(num_cores) as pool:
+        #    Fnu_list = pool.map(lambda args: calc_one(args), params)
         Fnu_list = jax.vmap(calc_one)(nu_grid, delta_arr, line_masks,B_nu_grid)#np.array([self.calc_Fnu(*args) for args in params])
         return Fnu_list
 
@@ -313,7 +288,7 @@ class Photosphere:
         nu_max_arr = self.rest_frequencies / (1 - self.v_max / c)
 
         #fig, ax = plt.subplots()
-        mask = np.zeros_like(nu_grid, dtype=int)
+        mask = np.zeros_like(nu_grid, dtype=bool)
         #offset = 0
         #ax.scatter(c*1e7/nu_grid[mask], (np.ones_like(nu_grid) + offset)[mask], s=1, alpha=0.2)
         for i, (nu_min, nu_max) in enumerate(zip(nu_min_arr, nu_max_arr)):
@@ -327,7 +302,7 @@ class Photosphere:
         #plt.show()
         return ~mask
 
-    def calc_spectrum(self, start_wav=3_500*u.AA, end_wav=22_500*u.AA, n_points=280):
+    def calc_spectrum(self, start_wav=3_500*u.AA, end_wav=22_500*u.AA, n_points=200):
         """
         I was thinking, if I pass v_phot and v_max here that can be used for a fitting routine
         it can be used to update v_phot and v_max set in the Photosphere object
@@ -359,10 +334,10 @@ class Photosphere:
         p_grid = np.linspace(0, self.r_max, 200)
 
         t_i = time.time()
-        Fnu_list = self._calc_Fnu_list(nu_grid, line_masks, B_nu_grid, p_grid)
+        Fnu_list = self.calc_spectral_flux(nu_grid, line_masks, B_nu_grid, p_grid)
 
         print(f"Time taken: {(time.time() - t_i):.3f} seconds for full spectrum calculation")
-        print("Devices: ", jax.devices(), "count: ", jax.device_count())
+        #print("Devices: ", jax.devices(), "count: ", jax.device_count())
         
         F_lambda = convert_flux(nu_grid * u.Hz, Fnu_list * Bnu_cgs_unit * u.rad**2, out_flux_unit='1e20 erg / (s AA cm2)')# * u.sr
         wavelength_grid = (lamb_grid).to("AA").value
