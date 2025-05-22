@@ -1,8 +1,11 @@
 import os
+from pathos.multiprocessing import ProcessingPool
 from collections.abc import Iterable
 from fractions import Fraction
-from functools import cache
+from functools import cache, partial
 
+import time
+import multiprocessing as mp
 import astropy.units as u
 import matplotlib as mpl
 import matplotlib.pyplot as plt
@@ -25,6 +28,9 @@ from NLTE.NLTE_model import (CollisionProcess, Environment,
                              PhotoionizationProcess, RadiativeProcess,
                              RecombinationProcess, States)
 from pcygni_5_Spec_Rel import PcygniCalculator
+
+
+num_cores = mp.cpu_count()
 
 # truncate all data above this level (for now)
 MAX_ENERGY_LEVEL = 25_000.0 # cm-1, corresponds to 400 nm from ground state.
@@ -817,11 +823,52 @@ if __name__ == "__main__":
     #plot_ionization_temporal(np.array([4400, 3200, 2900, 2800]), np.array([1.43, 2.42, 3.41, 4.40]),
     #                       np.array(v_phots))
     #tau_wavelength = None
+
+    def _compute_tau_shell(v_line, epoch, T_elec, mass_fraction, atomic_mass,
+                           v_phot):
+        env = Environment(t_d=epoch, T_phot=T_elec, mass_fraction=mass_fraction,
+                          atomic_mass=atomic_mass, photosphere_velocity=v_phot,
+                          line_velocity=v_line, T_electrons=T_elec)
+        
+        solver = NLTESolver(env, SrII_states, processes=[
+                                RadiativeProcess(SrII_states, env),
+                                CollisionProcess(SrII_states, env),
+                                HotElectronIonizationProcess(SrII_states, env),
+                                RecombinationProcess(SrII_states, env),
+                                # PhotoionizationProcess(SrII_states, env)
+                            ])
+        t_arr, pops, tau_mat = NLTE.NLTE_model.solve_NLTE_sob(env, SrII_states, solver, mass_fraction)
+
+        depths, wavelengths, g_up, g_lo, n_up, n_lo = get_line_transition_data(
+            tau_mat, SrII_states, pops[:, -1]
+        )
+        return depths, pops[:, -1], g_up, g_lo, n_up, n_lo, wavelengths
+    
+
+
     tau_v = lambda v, vphot, tauref, ve: tauref*np.exp((vphot-v)/ve)
     #plot_velocity_shells(T_elec_epochs.keys(), v_phots, v_outs, mass_fractions)
+    
+    
+    
+    
     for i, (epoch, T_e) in enumerate(T_elec_epochs.items()):
         tau_shells = []
-        v_shells = np.linspace(v_phots[i], v_outs[i], 20)
+        v_shells = np.linspace(v_phots[i],0.5, 50)
+
+
+        compute_tau_shell_worker = partial(_compute_tau_shell,
+                                           epoch=epoch,
+                                            T_elec=T_e,
+                                            atomic_mass=88,
+                                            mass_fraction=mass_fractions[i],
+                                            v_phot=v_phots[i])
+        with ProcessingPool(num_cores) as pool:
+            results = pool.map(compute_tau_shell_worker, v_shells)
+
+
+        # TODO: unpaack  the results here
+
         print("COUNTING!: ", i, epoch, T_e)
         colors = mpl.colormaps['coolwarm'](np.linspace(0, 1., len(T_elec_epochs)))
         spec_ep = xshooter_data(day=epoch)
@@ -836,7 +883,7 @@ if __name__ == "__main__":
         # this continuum object will be passed to the line formation code.
         continuum = BlackBody(temperature = T * u.K, scale=amplitude*u.Unit("1e20 * erg/(s sr cm2 AA)"))
         
-        shell_occupancies = []
+        """shell_occupancies = []
         g_upper = []
         g_lower = []
         n_upper_grid = []
@@ -885,7 +932,7 @@ if __name__ == "__main__":
             #tau_wavelength = resonance_wavelengths # this should be the resonance line
             shell_occupancies.append(level_occupancy[:,-1])
             n_upper_grid.append(n_upper)
-            n_lower_grid.append(n_lower)
+            n_lower_grid.append(n_lower)"""
         # plot the spatial profile of tau
         if False:
             plot_tau_shells(tau_shells, tau_wavelength)
@@ -896,44 +943,51 @@ if __name__ == "__main__":
         #compare_ionization_profile(v_shells, shell_occupancies, T, epoch)
 
         # convert these list objects to a numpy array
-        tau_shells = np.array(tau_shells)
-        n_upper_grid = np.array(n_upper_grid)
-        n_lower_grid = np.array(n_lower_grid)
+        tau_shells, shell_occ, g_upper, g_lower, n_up_grids, n_lower_grid, resonance_wavelengths = zip(*results)
+        tau_shells   = np.array(tau_shells)
+        shell_occ    = np.array(shell_occ)
+        n_upper_grid   = np.array(n_up_grids)
+        n_lower_grid   = np.array(n_lower_grid)
+        #tau_shells = np.array(tau_shells)
+        #n_upper_grid = np.array(n_upper_grid)
+        #n_lower_grid = np.array(n_lower_grid)
         #for grid in [tau_shells, n_upper_grid, n_lower_grid]:
         #    grid = np.array(grid)
 
         line_transition_objects = []
-        for j, line_wavelength in enumerate(resonance_wavelengths):
+        for j, line_wavelength in enumerate(resonance_wavelengths[0]):
             # ignore forbidden lines that are too weak and will not be visible
             if np.max(tau_shells[:,j]) < 1e-3: continue
             line_transition = LineTransition(
-                                    line_wavelength,
-                                    tau_shells[:,j],
+                                    (line_wavelength).to("cm").value,
+                                    tau_shells[:,j], # equatorial ejecta
+                                    tau_shells[:,j], # polar ejecta
                                     v_shells, 
-                                    g_upper[j], 
-                                    g_lower[j], 
+                                    g_upper[0][j], 
+                                    g_lower[0][j], 
                                     n_upper_grid[:,j], 
                                     n_lower_grid[:,j]
                             )
             line_transition_objects.append(line_transition)
-        photosphere = Photosphere(v_phot=v_phots[i] * c, 
-                                  v_max=v_outs[i] * c,
-                                  t_d=epoch * u.day,
+        
+        photosphere = Photosphere(v_phot=(v_phots[i] * c).cgs.value, 
+                                  v_max=(v_outs[i] * c).cgs.value,
+                                  t_d=(epoch * u.day).cgs.value,
                                   continuum=continuum,
                                   line_list=line_transition_objects)
-        
+        #photosphere.visualize_polar_region()
         full_wav_grid, spectrum_flux = photosphere.calc_spectrum()
         #exit()
         ax.plot(full_wav_grid, scale[i]*spectrum_flux + offsets[i], marker='.',
                             ls='--', ms=1, c=aayush_colors[i], label=f"more physical model t={epoch}")
         #    print(f"Line {res_lamb:.1f}nm
-        pcygni_line = lambda wav, vphot=v_phots[i], vout=v_outs[i]: blackbody_with_pcygnis(wav, tau_shells[0,:], resonance_wavelengths,
-                                    fitted_cont, t_0=(epoch * u.day).to('s'), v_out=vout, v_phot=vphot, ve=ve_s[i], display=False)
+        #pcygni_line = lambda wav, vphot=v_phots[i], vout=v_outs[i]: blackbody_with_pcygnis(wav, tau_shells[0,:], resonance_wavelengths,
+        #                            fitted_cont, t_0=(epoch * u.day).to('s'), v_out=vout, v_phot=vphot, ve=ve_s[i], display=False)
                             #environment=environment, states=SrII_states, level_occupancy=level_occupancy[:, -2:-1], A_rates=)
-        ax.plot(wavelength_grid, scale[i]*pcygni_line(wavelength_grid) + offsets[i], c='k', ls='-', lw=0.25)
-        ax.fill_between(wavelength_grid.value, scale[i]*pcygni_line(wavelength_grid) + offsets[i],
-                scale[i]*fitted_cont.eval(wavelength_grid=wavelength_grid) + offsets[i],
-                            fc='#ebc3d4', alpha=0.7) #ebc3d4
+        #ax.plot(wavelength_grid, scale[i]*pcygni_line(wavelength_grid) + offsets[i], c='k', ls='-', lw=0.25)
+        #ax.fill_between(wavelength_grid.value, scale[i]*pcygni_line(wavelength_grid) + offsets[i],
+        #        scale[i]*fitted_cont.eval(wavelength_grid=wavelength_grid) + offsets[i],
+        #                    fc='#ebc3d4', alpha=0.5) #ebc3d4
 
         '''v_grid = np.linspace(v_phots[i]-0.03, v_phots[i]+0.03, 60)
         grid_residuals = []
@@ -971,8 +1025,9 @@ if __name__ == "__main__":
         ax.plot(wavelength_grid, scale[i]*fitted_cont.eval(wavelength_grid=wavelength_grid) + offsets[i],
                        ls='-', color='dimgray', #label=f"{T:.2f} $\pm$ {T_sigma:.2f}",
                        lw=0.5,)
-        ax.plot(spec_ep[:,0], scale[i]*spec_ep[:,2]+ offsets[i], ls='-', color='darkgray', alpha=0.4, lw=0.75) #/fitted_cont.eval(wavelength_grid=spec_ep[:,0]) - i 
-        ax.plot(spec_ep[:,0], scale[i]*spec_ep[:,1]+ offsets[i], ls='-', color=colors[i], lw=0.75,
+        nan_mask = ~np.isnan(spec_ep[:, 1])
+        ax.step(spec_ep[nan_mask,0], scale[i]*spec_ep[nan_mask,2]+ offsets[i], ls='-', color='darkgray', alpha=0.4, lw=0.75) #/fitted_cont.eval(wavelength_grid=spec_ep[:,0]) - i 
+        ax.step(spec_ep[nan_mask,0], scale[i]*spec_ep[nan_mask,1]+ offsets[i], ls='-', color=colors[i], lw=0.75,
                           alpha=1., label=f'$t={epoch}$ days')
         # TODO: 
         #display_time_solution(t, level_occupancy, tau_all_timesteps, environment)
