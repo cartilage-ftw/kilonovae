@@ -1,5 +1,4 @@
-from numba import njit
-from pathos.multiprocessing import ProcessingPool
+from jax.sharding import Mesh, PartitionSpec
 from synphot.units import convert_flux
 from astropy.constants import c, h, k_B
 from astropy.modeling.physical_models import BlackBody
@@ -26,8 +25,8 @@ Author: Aayush
 """
 
 num_cores = mp.cpu_count()
-#jax.config.update('jax_num_cpu_devices', num_cores)
-print("Number of CPU cores available", num_cores)
+jax.config.update('jax_num_cpu_devices', num_cores)
+print("Number of CPU cores available", jax.device_count())
 
 # I don't like cgs units, but we're doing astronomy so I have to live with it
 c = c.cgs.value
@@ -244,6 +243,7 @@ class Photosphere:
         """
         return jnp.where(p < (self.v_phot*self.t_d), continuum, 0.)
 
+
     @jax.jit
     def I_emit(self, p:float, delta_arr: jnp.array, continuum: float):
         z_arr = calc_z(p, self.t_d, delta_arr)
@@ -280,17 +280,23 @@ class Photosphere:
         #    return (2*np.pi*self.r_min**2)* B_nu
         #$else:
         F_continuum = jnp.pi * self.r_min**2 * B_nu
-        def line_flux(_):
+        def line_flux():
             I_vals = jax.vmap(lambda p: self.I_emit(p, delta_arr, B_nu))(p_grid)
             return 2*np.pi* jnp.trapezoid(I_vals, p_grid)
-        return jax.lax.cond(line_mask, line_flux, lambda _: F_continuum, operand=None)
+        return jnp.where(line_mask, line_flux(), F_continuum)
 
 
     @jax.jit
     def _calc_Fnu_list(self, nu_grid, line_masks, B_nu_grid, p_grid):
-        #mesh = jax.make_mesh((num_cores,), ('x',))
+        #mesh = Mesh(jax.devices(), ('x',))
         delta_arr = nu_grid[:, None] / jnp.array(self.rest_frequencies)[None,:]
         calc_one = lambda nu, delta, line_mask, B: self.calc_Fnu(nu, delta, line_mask,  p_grid, B)
+        '''Fnu_list = jax.shard_map(calc_one, mesh=mesh,
+                                    in_specs=(PartitionSpec('x'),
+                                              PartitionSpec('x', None),
+                                              PartitionSpec('x'),
+                                              PartitionSpec('x')),
+                                    out_specs=PartitionSpec('x'))(nu_grid, delta_arr, line_masks, B_nu_grid)'''
         Fnu_list = jax.vmap(calc_one)(nu_grid, delta_arr, line_masks,B_nu_grid)#np.array([self.calc_Fnu(*args) for args in params])
         return Fnu_list
 
@@ -321,7 +327,7 @@ class Photosphere:
         #plt.show()
         return ~mask
 
-    def calc_spectrum(self, start_wav=3_500*u.AA, end_wav=22_500*u.AA, n_points=200):
+    def calc_spectrum(self, start_wav=3_500*u.AA, end_wav=22_500*u.AA, n_points=280):
         """
         I was thinking, if I pass v_phot and v_max here that can be used for a fitting routine
         it can be used to update v_phot and v_max set in the Photosphere object
@@ -354,8 +360,10 @@ class Photosphere:
 
         t_i = time.time()
         Fnu_list = self._calc_Fnu_list(nu_grid, line_masks, B_nu_grid, p_grid)
+
         print(f"Time taken: {(time.time() - t_i):.3f} seconds for full spectrum calculation")
         print("Devices: ", jax.devices(), "count: ", jax.device_count())
+        
         F_lambda = convert_flux(nu_grid * u.Hz, Fnu_list * Bnu_cgs_unit * u.rad**2, out_flux_unit='1e20 erg / (s AA cm2)')# * u.sr
         wavelength_grid = (lamb_grid).to("AA").value
         return wavelength_grid, F_lambda.value/(np.pi*self.r_min**2)
