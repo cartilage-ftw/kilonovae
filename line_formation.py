@@ -26,6 +26,7 @@ Author: Aayush
 """
 
 num_cores = mp.cpu_count()
+#jax.config.update('jax_num_cpu_devices', num_cores)
 print("Number of CPU cores available", num_cores)
 
 # I don't like cgs units, but we're doing astronomy so I have to live with it
@@ -41,14 +42,12 @@ def fast_interpolate(x_new: float, v_grid: np.array, y_grid: np.array):
     """
     return jnp.interp(x_new, v_grid, y_grid)
 
-
 @jax.jit
 def W(r, r_min):
     """
     The geometric dilution factor.
     """
     return (1 - jnp.sqrt(1 - (r_min/r)**2)) / 2
-
 
 @jax.jit
 def source_function(v, g_u, g_l, n_u_grid, n_l_grid, v_grid, nu_0):
@@ -59,7 +58,6 @@ def source_function(v, g_u, g_l, n_u_grid, n_l_grid, v_grid, nu_0):
     n_u = jnp.interp(v / c, v_grid, n_u_grid)
     n_l = jnp.interp(v / c, v_grid, n_l_grid)
     return (2 * h * nu_0**3 / c**2) / (g_u * n_l / (g_l * n_u) - 1)
-
 
 @jax.jit
 def S(p, z, r, r_min, r_max, v, g_u, g_l, n_u_grid, n_l_grid, v_grid, nu_0, continuum, mode='level-pop'):
@@ -110,9 +108,11 @@ class LineTransition:
         self._tau_interp_polar = lambda v: fast_interpolate(v/c, self.velocity_grid, self.tau_grid_polar)
     
 
+@jax.jit
 def calc_r(p: float, z: float):
     return jnp.sqrt(p**2 + z**2)
 
+@jax.jit
 def calc_z(p: float, t: float, delta: np.array):
     """
     Location of the Sobolev resonance plane. A specific intensity beam I_\nu interacts
@@ -129,7 +129,6 @@ def calc_z(p: float, t: float, delta: np.array):
     z = c*t*(delta**2/(1+delta**2) - delta**2/(1+delta**2) * (1+(1+delta**2)/delta**4*( (1-delta**2-(p/c/t)**2)))**(1/2))
     return z
 
-
 @jax.jit
 def is_polar_ejecta(p, z, polar_opening_angle, observer_inclination_angle):
     """
@@ -142,6 +141,26 @@ def is_polar_ejecta(p, z, polar_opening_angle, observer_inclination_angle):
     z_new = -p * jnp.sin(beta) + z * jnp.cos(beta)
     return jnp.where((jnp.abs((jnp.arctan(p_new/z_new))) < polar_opening_angle/2), 1, 0)
 
+@jax.jit
+def tau_global(self, line, p, z, r,v, t_d, v_phot, v_max, polar_opening_angle, observer_angle):
+    # including the relativistic correction for tau from Hutsemekers & Surdej (1990)
+    mu = z / r
+    beta = v/c
+    corr = abs( (1-mu*beta)**2/( (1-beta)*(mu*(mu-beta)+(1-mu**2)*(1-beta**2))) )
+
+    # decide between polar and equatorial ejecta
+    tau_ = np.where(is_polar_ejecta(p,z, polar_opening_angle, observer_angle),
+                corr*line._tau_interp_polar((v/c)),
+                corr*line._tau_interp_eq((v/c))
+                )
+
+    outside_photosphere = (r <= v_phot*t_d) | (r > v_max*t_d)
+    occulted_region = (z < 0) & (p < self.r_min)
+    return np.where( 
+                    outside_photosphere | occulted_region,
+                    1e-15,
+                    tau_,
+                )
 
 @partial(jax.tree_util.register_dataclass, 
          data_fields=['polar_opening_angle', 'observer_angle'],
@@ -225,37 +244,35 @@ class Photosphere:
         """
         return jnp.where(p < (self.v_phot*self.t_d), continuum, 0.)
 
-
     @jax.jit
-    def I_emit(self, p:float, delta_arr: np.array, continuum: float):
+    def I_emit(self, p:float, delta_arr: jnp.array, continuum: float):
         z_arr = calc_z(p, self.t_d, delta_arr)
-        r_arr = calc_r(p, z_arr)
+        r_arr  = calc_r(p, z_arr)
         v_arr = r_arr/self.t_d
-        tau_i = []
-
-        #return p * continuum
-    
         # For the scattering part, the line summation has to be done in the minus \hat{n} direction (i.e. going inwards
         # from observer's line of sight to the center of the explosion, instead of inside to out); see eqn (22) of Jeffrey & Branch (1990)
         # to do the ordering, you have to know where the Sobolev resonance plane lies for each particular line;
         # and that's just 'z' in the impact geometry.
         order = jnp.argsort(z_arr)[::-1]
-        
-        I_scat = 0.
         # a helper function, because the S function is a bit long
         S_i = lambda line, p, z, r, v: S(p, z, r, self.r_min, self.r_max, v, line.g_upper, line.g_lower, line.n_upper, line.n_lower, line.velocity_grid, line.nu_0, continuum)  
-        _Si = []
-        for i in range(len(self.line_list)):
-            line = self.line_list[i]
-            tau_i.append(self.tau(line, p, z_arr[i], r_arr[i], v_arr[i]))
-            _Si.append(S_i(line, p, z_arr[i], r_arr[i], v_arr[i]))
+        
+        tau_i = jnp.zeros_like(z_arr)
+        _Si = jnp.zeros_like(z_arr)
+
+        for i, line in enumerate(self.line_list):
+            tau_i = tau_i.at[i].set(self.tau(line, p, z_arr[i], r_arr[i], v_arr[i]))
+            _Si = _Si.at[i].set(S_i(line, p, z_arr[i], r_arr[i], v_arr[i]))
+        
         tau_i = jnp.array(tau_i)[order]
         _Si = jnp.array(_Si)[order]
-        for i in range(len(self.line_list)):
-            I_scat += _Si[i] * (1-jnp.exp(-tau_i[i])) * jnp.exp(-jnp.sum(tau_i[:i-1]))
+
+        I_scat = 0.
+        for i in range(len(tau_i)):
+            I_scat += _Si[i] * (1-jnp.exp(-tau_i[i])) * jnp.exp(-np.sum(tau_i[:i-1]))
         
         return p * (self.I(p, continuum)*jnp.exp(-jnp.sum(tau_i)) + I_scat)
-    
+
 
     @jax.jit
     def calc_Fnu(self, nu: float, delta_arr: np.array, line_mask: np.array, p_grid: np.array, B_nu: float):
@@ -266,14 +283,17 @@ class Photosphere:
         def line_flux(_):
             I_vals = jax.vmap(lambda p: self.I_emit(p, delta_arr, B_nu))(p_grid)
             return 2*np.pi* jnp.trapezoid(I_vals, p_grid)
-        return jax.lax.cond(line_mask, line_flux, lambda nu: F_continuum, operand=None)
+        return jax.lax.cond(line_mask, line_flux, lambda _: F_continuum, operand=None)
+
 
     @jax.jit
     def _calc_Fnu_list(self, nu_grid, line_masks, B_nu_grid, p_grid):
+        #mesh = jax.make_mesh((num_cores,), ('x',))
         delta_arr = nu_grid[:, None] / jnp.array(self.rest_frequencies)[None,:]
         calc_one = lambda nu, delta, line_mask, B: self.calc_Fnu(nu, delta, line_mask,  p_grid, B)
         Fnu_list = jax.vmap(calc_one)(nu_grid, delta_arr, line_masks,B_nu_grid)#np.array([self.calc_Fnu(*args) for args in params])
         return Fnu_list
+
 
     def get_line_mask(self, nu_grid):
         """
@@ -300,13 +320,6 @@ class Photosphere:
             #         s=f"{c*1e7/self.rest_frequencies[i]:.2f}", fontsize=11)
         #plt.show()
         return ~mask
-    
-
-    '''def calc_flux_at_nu(self, nu, delta, line_mask, B_nu, p_grid):
-        if line_mask:
-            return np.pi * self.r_min**2 * B_nu
-        I_vals = np.array([ self.I_emit(p, nu, delta, line_mask, B_nu) for p in p_grid])
-        return 2* np.pi * np.trapz(I_vals, p_grid)'''
 
     def calc_spectrum(self, start_wav=3_500*u.AA, end_wav=22_500*u.AA, n_points=200):
         """
@@ -339,18 +352,10 @@ class Photosphere:
         line_masks = self.get_line_mask(nu_grid)
         p_grid = np.linspace(0, self.r_max, 200)
 
-        params = [
-            (nu, nu/self.rest_frequencies, line_masks[i], B_nu_grid[i], p_grid)
-            for i, nu in enumerate(nu_grid)
-        ]
-
-        
         t_i = time.time()
-        #with ProcessingPool(num_cores) as pool:
-        #    Fnu_list = pool.map(lambda args: self.calc_flux_at_nu(*args), params)
         Fnu_list = self._calc_Fnu_list(nu_grid, line_masks, B_nu_grid, p_grid)
         print(f"Time taken: {(time.time() - t_i):.3f} seconds for full spectrum calculation")
-
+        print("Devices: ", jax.devices(), "count: ", jax.device_count())
         F_lambda = convert_flux(nu_grid * u.Hz, Fnu_list * Bnu_cgs_unit * u.rad**2, out_flux_unit='1e20 erg / (s AA cm2)')# * u.sr
         wavelength_grid = (lamb_grid).to("AA").value
         return wavelength_grid, F_lambda.value/(np.pi*self.r_min**2)
@@ -359,8 +364,3 @@ class Photosphere:
 if __name__ == "__main__":
     # some sanity checking plots
     print("Nothing crashed! Can we celebrate that?")
-
-
-    #@partial(jax.jit, static_argnames=('line_mask',))
-    #@jax.jit
-    
