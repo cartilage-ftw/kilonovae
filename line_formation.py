@@ -302,7 +302,7 @@ class Photosphere:
         #plt.show()
         return ~mask
 
-    def calc_spectrum(self, start_wav=3_500*u.AA, end_wav=22_500*u.AA, n_points=200):
+    def calc_spectrum(self, start_wav=3_500*u.AA, end_wav=22_500*u.AA, n_points=5000):
         """
         I was thinking, if I pass v_phot and v_max here that can be used for a fitting routine
         it can be used to update v_phot and v_max set in the Photosphere object
@@ -331,7 +331,7 @@ class Photosphere:
         # In a lot of the spectrum, there may not be any opacity to cause absorption/emission
         # in those parts, just return the continuum. This mask is used to decide that.
         line_masks = self.get_line_mask(nu_grid)
-        p_grid = np.linspace(0, self.r_max, 200)
+        p_grid = np.linspace(0, self.r_max, 5000)
 
         t_i = time.time()
         Fnu_list = self.calc_spectral_flux(nu_grid, line_masks, B_nu_grid, p_grid)
