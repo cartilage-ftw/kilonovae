@@ -1,5 +1,8 @@
 
-python < 3.12 # In Python 3.12 a lot of the escape characterswere cause errors; too lazy to rewrite all regex
+python>=3.11
+jax==0.5.0 # for some reason, jax-metal with jax 0.5.1 is broken
+jax-metal
+pathos # multiprocessing CPU cores
 roman # just for handling roman numerals in ionization stage names
 astropy
 scipy
