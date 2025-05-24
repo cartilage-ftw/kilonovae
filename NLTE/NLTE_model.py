@@ -12,6 +12,7 @@ import io
 import re
 import warnings
 import matplotlib.pyplot as plt
+import time
 
 #################### Hyperparameters: Included atomic levels and physical parameters ####################
 
@@ -100,13 +101,13 @@ def dMdv(v, t):
     return (dM_dV.cgs * dV_dr.cgs * dr_dv.cgs * consts.c).cgs.value
 
 @lru_cache
-def get_density_profile(M_ej, atomic_mass, mass_fraction):
+def get_density_profile(M_ej, atomic_mass, mass_fraction, power_law_exponent):
     M_ej = M_ej * u.M_sun
     atomic_mass = atomic_mass * u.u
     # we calculate the density profile at t=1 day, and normalize it to 0.04 solar mass
-    rho_0 =  M_ej / (quad(dMdv, 0.1, 0.5, args=1)[0] * u.g/u.cm**3)
+    rho_0 =  M_ej / (quad(dMdv, 0.1, 0.5, args=(1,))[0] * u.g/u.cm**3)
     number_density_0 = (rho_0 * mass_fraction / atomic_mass).cgs.value
-    return lambda v, t: rho(v, t, number_density_0)
+    return lambda v, t: rho(v, t, number_density_0, power_law_exponent)
 
 # Environment class, contains all the parameters of the environment at a given time and radius, the inputs to the NLTE calculation
 # The following parameters are calculated from the input parameters:
@@ -128,38 +129,43 @@ class Environment:
     # calculated values (Will be calculated from the input values)
     spectrum : BlackBody = None # Experienced spectrum at the ROI. Contains the doppler shifted temperature
     T_electrons: float = None # K temperature of the electrons (doppler shifted photosphere temperature)
-    n_e: float = None # count/cm^3	
+    # default: (self.line_velocity/0.2)**-5 # Extracted from the paper, see electron_model_reconstruction.ipynb
+    n_e: float = 1.5e8 * line_velocity/0.284**-5 # count/cm^3	
     n_He: float = None # count/cm^3
-    q_dot: float = None # eV/s/ion
+    q_dot: float = 1. # eV/s/ion
+    power_law_exponent: int = 5 # atomic density goes as v**-p
     # Calculate derived values based on the input values
     def __post_init__(self):
         # Doppler shifted temperature according to the paper. Note that the paper incorrectly did not do this
         delta_v = self.line_velocity - self.photosphere_velocity
-        # commenting out the dopler shift reproduce Tarumi's results
+        # commenting out the dopler shift reproduce Tarumi's results; t*(1+30*delta_v**2)
         self.T_electrons = self.T_phot/(1/np.sqrt(1 - delta_v**2) * (1+delta_v)) # Doppler shifted temperature
         W = 0.5*(1-np.sqrt(1-(self.photosphere_velocity/self.line_velocity)**2)) # geometric dilution factor
         self.spectrum = BlackBody(self.T_electrons * u.K, scale=W*u.Unit("erg/(s Hz sr cm2)")) 
-        self.n_e = (1.5e8*self.t_d**-3) * (self.line_velocity/0.284)**-5 # Extracted from the paper, see electron_model_reconstruction.ipynb
-        self.n_He = get_density_profile(self.M_ejecta, self.atomic_mass, self.mass_fraction)(self.line_velocity, self.t_d)
-        self.q_dot = 1 * self.t_d**-1.3 # Radiative power of non-thermal electrons
+        # I want to be able to provide the electron density without time dependence,
+        # and non-parametrically
+        # this allows it
+        self.n_e = (self.n_e * self.t_d**-3)
+        self.n_He = get_density_profile(self.M_ejecta, self.atomic_mass, self.mass_fraction, self.power_law_exponent)(self.line_velocity, self.t_d)
+        self.q_dot = self.q_dot * self.t_d**-1.3 # Radiative power of non-thermal electrons
 
-def get_num_density(mass_fraction, env):
-    n_He = get_density_profile(env.M_ejecta, env.atomic_mass, mass_fraction)(env.line_velocity, env.t_d)
+def get_num_density(mass_fraction, env, power_law_exponent):
+    n_He = get_density_profile(env.M_ejecta, env.atomic_mass, mass_fraction, power_law_exponent)(env.line_velocity, env.t_d)
     if env.n_He != n_He:
         env.n_He = n_He
     # needed this to allow treating mass_fraction as a free parameter for fitting
     return n_He
     
-def pop_to_tau(environment, states, y, A, mass_fraction):
-    assert y.T.shape[1] == len(states.all_names)
-    n = y.T[-1,:len(states.names)] * get_num_density(mass_fraction, environment) * u.cm**-3
+def estimate_tau(environment, states, y, A, mass_fraction, power_law_exponent):
+    assert y.T.shape[0] == len(states.all_names)
+    n = y.T[:len(states.names)] * get_num_density(mass_fraction, environment, power_law_exponent) * u.cm**-3
     eps0 = 1/(4 * np.pi) # i dont like gauss units
     tau = np.zeros((len(n), len(n)))
     # The sobolev depth is calculated individually for each transition
     # Yes i know, loop, very inefficient, but this is a small matrix
     for i in range(len(n)): 
         for j in range(len(n)):
-            dE = states.energies[j] - states.energies[i]
+            dE = (states.energies[j] - states.energies[i])
             if dE <= 0:
                 continue
             lam = dE.to("cm", equivalencies=u.spectral())
@@ -177,7 +183,7 @@ def pop_to_tau(environment, states, y, A, mass_fraction):
 # First the NLTE equations are solved assuming optically thin conditions, 
 # then the sobolev depth is calculated, the transition rates are adjusted, and the NLTE equations are solved again
 # These are 
-def solve_NLTE_sob(environment, states, nlte_solver, mass_fraction, relaxation_steps = 2): 
+def solve_NLTE_sob(environment, states, nlte_solver, mass_fraction, relaxation_steps = 10): 
     get_process = lambda solver, process: [p for p in solver.processes if isinstance(p, process)][0]
     radiative_process = get_process(nlte_solver, RadiativeProcess)
     # save the original rates
@@ -185,17 +191,68 @@ def solve_NLTE_sob(environment, states, nlte_solver, mass_fraction, relaxation_s
     absorption_rate = radiative_process.arbsorbtion_rate
     stimulated_emission_rate = radiative_process.stimulated_emission_rate
 
+    tau_prev = None
+    beta = 999. # purposely initialize to a ridiculously large value; beta is always <= 1
     # perform a few relaxation steps to get the correct sobolev depth
+
     for _ in range(relaxation_steps):
         _, y = nlte_solver.solve(1e6)
-        tau = pop_to_tau(environment, states, y, radiative_process.A, mass_fraction)
-        beta = np.array((1-np.exp(-tau)) / tau)
+        tau = estimate_tau(environment, states, y[:,-1], radiative_process.A, mass_fraction, environment.power_law_exponent)
+        if tau_prev is None:
+            tau_prev = tau
+        tau = (tau + tau_prev)/2
+        #tau_all.append(tau)
+        tau_prev = tau
+        beta = np.array((1-np.exp(-tau)) / tau)#np.minimum(beta, )
         # due to "self-absorption", the effective transition rates are \beta times the true atomic rates
         radiative_process.A = A * beta
         radiative_process.absorption_rate = absorption_rate * beta
         radiative_process.stimulated_emission_rate = stimulated_emission_rate * beta
-    return tau, nlte_solver.solve(1e6)[1][:,-1], nlte_solver
+
+    # to see what these look like while steady-state solution is reached
+    t, occupancy_all = nlte_solver.solve(1e6)
+    '''tau_all_timesteps = np.array([
+                            estimate_tau(
+                                environment, states,
+                                occupancy_all[:,i:i+1][:,0],
+                                radiative_process.A, mass_fraction)
+                            # for each time step while solving.
+                            for i in range(len(t))])
+
+    # line luminosity dictates the cooling rate and emission strength
+    line_luminosities = np.zeros_like(tau)
+    for i in range(len(states.names)):
+        for j in range(len(states.names)):
+            dE = states.energies[j] - states.energies[i]
+            if dE >= 0: continue
+            line_luminosities[i,j] = (environment.n_He*occupancy_all[j,-1]*dE*radiative_process.A[j,i]).cgs.value#*beta[i,j]
+            # just make it a symmetric matrix to avoid confusion
+            line_luminosities[j,i] = line_luminosities[i,j]'''
+            
+    return t, occupancy_all, tau #tau_all_timesteps, line_luminosities#, nlte_solver
         
+
+'''print("occupancy", occupancy_all[j,-1])
+            print(r"\beta*A", radiative_process.A[i,j])
+            print(r"A[j,i]", radiative_process.A[j,i])
+            print(f"Luminosity of this line {-dE.to('nm', equivalencies=u.spectral())}nm: ", line_luminosities[i,j])
+'''
+                #print("done calculating, now just plotting")
+'''fig, ax = plt.subplots()
+    for i in range(len(tau)):
+        for j in range(len(tau)):
+            if i <= j: continue
+            lamb = np.abs(states.energies[i] - states.energies[j]).to('AA', equivalencies=u.spectral())
+            ax.plot(np.linspace(1, len(tau_all), len(tau_all)), np.array(tau_all)[:,i,j], label=f'${lamb.value:.0f}\AA$')
+            ax.set_ylabel(r"$\tau$")
+            ax.set_xlabel('Relaxation Step')
+    tau_arr = np.array(tau_all)[:,0,-1]
+    tau_mean = [sum(tau_arr[i:i+1])/2 for i in range(len(tau_arr))]
+    print("Mean of the solution\n", tau_mean)
+    #print("Difference in tau", np.diff(np.array(tau_all)[:,0,-1]))
+    #ax.set_yscale("log")
+    ax.legend(loc='upper right')
+    plt.show()'''
 
 # primary class, contains all the states and processes, and solves the system of differential equations
 class NLTESolver:
@@ -252,11 +309,11 @@ class CollisionProcess:
     
     def get_transition_rate_matrix(self):
         # different tables for helium and strontium
-        print("-----\nGetting collisionr ates", self.states.ionization_species)
+        #print("-----\nGetting collisionr ates", self.states.ionization_species)
         if sum('He' in s for s in self.states.ionization_species) > 0:
             return NLTE.collision_rates.get_collision_rates_Ralchenko(self.states, self.environment.T_electrons)*self.environment.n_e
         else: # for strontium
-            return NLTE.collision_rates.get_effective_strength_mulholland(self.states, self.environment.T_electrons)*self.environment.n_e 
+            return NLTE.collision_rates.get_effective_strength_mulholland(self.states, self.environment.T_electrons)*self.environment.n_e
     
 # Handles state -> state transitions due to radiative processes (spontaneous emission, stimulated emission and absorption)
 class RadiativeProcess:
@@ -271,7 +328,10 @@ class RadiativeProcess:
         
         #print("The states are", self.states.names)
         
-        A = get_A_rates(tuple(self.states.names)) * u.s**-1
+        if 'HeII' in self.states.all_names:
+            A = get_A_rates_He(tuple(self.states.names)) * u.s**-1
+        else:
+            A = get_A_rates(tuple(self.states.names)) * u.s**-1
         E_diff = self.states.energies - self.states.energies[:,np.newaxis]
         
         #print("The multiplicities are:", self.states.multiplicities)
@@ -333,7 +393,7 @@ class RecombinationProcess:
               self.alphaSrIII(np.log10(T)) * self.environment.n_e / len(self.states.names)
         coeff_mat[all_names.index('Sr III'), all_names.index('Sr IV')] = self.alphaSrIV(np.log10(T)) * self.environment.n_e
         if 'Sr V' in self.states.ionization_species:
-            coeff_mat[all_names.index('Sr IV'), all_names.index('Sr V')] = 5*self.alphaHII(np.log10(T)) * self.environment.n_e
+            coeff_mat[all_names.index('Sr IV'), all_names.index('Sr V')] = self.alphaSrIV(np.log10(T)) * self.environment.n_e
         return coeff_mat
 
     def get_transition_rate_matrix(self):
@@ -409,6 +469,25 @@ def get_ionization_rates(states, spectrum):
         ionization_rates.append(np.trapz(x=nu, y=ionization_flux_article).to(1/u.s).value) 
     return np.array(ionization_rates) * 4 * np.pi # TODO find out why the 16*pi is needed
 
+
+@lru_cache
+def get_A_table_helium():
+    get_n = lambda n, l, count: (int(n)-1)*2 if count else (int(n)-1)
+    nist_table = pandas.read_csv("atomic data/A_rates_NIST.csv", dtype=str)
+    nist_table = nist_table.apply(lambda x: x.str.removeprefix("=\"").str.removesuffix("\"") if x.dtype == object else x, axis=1)
+    nist_table = nist_table[(nist_table['Aki(s^-1)'] != "")] # drop lines of no interest
+
+    def get_state_name(config_series, term_series):
+        n = config_series.str.findall(r"(\d+)(\w)(2?)").apply(lambda x: str(1+sum([get_n(*nlm) for nlm in x])))
+        return n+term_series.str.replace("*", "")
+
+    nist_table["lower_name"] = get_state_name(nist_table["conf_i"], nist_table["term_i"])
+    nist_table["upper_name"] = get_state_name(nist_table["conf_k"], nist_table["term_k"])
+    nist_table["A_rates"] = pandas.to_numeric(nist_table["Aki(s^-1)"])
+    nist_table["g_k"] = pandas.to_numeric(nist_table["g_k"])
+    nist_table["g_i"] = pandas.to_numeric(nist_table["g_i"])
+    return nist_table
+
 @lru_cache
 def get_A_table():
     get_n = lambda n, l, count: (int(n)-1)*2 if count else (int(n)-1)
@@ -437,6 +516,17 @@ def get_A_table():
     nist_table["g_i"] = pandas.to_numeric(nist_table["g_i"])
     return nist_table
 
+@lru_cache
+def get_A_rates_He(names):
+    nist_table = NLTE.NLTE_model.get_A_table_helium()
+    A_coefficients = np.zeros((len(names), len(names)))
+    for (lower_name, upper_name, _), subtable in nist_table.groupby(["lower_name", "upper_name", "J_i"]):
+        if not (lower_name in names and upper_name in names):
+            continue
+
+        weighted_A = np.average(subtable["A_rates"], weights = subtable["g_k"])
+        A_coefficients[names.index(lower_name),names.index(upper_name)] += weighted_A
+    return A_coefficients
 @lru_cache
 def get_A_rates(names):
     nist_table = NLTE.NLTE_model.get_A_table()
