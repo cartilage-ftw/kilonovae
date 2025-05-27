@@ -101,13 +101,13 @@ def dMdv(v, t):
     return (dM_dV.cgs * dV_dr.cgs * dr_dv.cgs * consts.c).cgs.value
 
 @lru_cache
-def get_density_profile(M_ej, atomic_mass, mass_fraction, power_law_exponent):
+def get_density_profile(M_ej, atomic_mass, mass_fraction):
     M_ej = M_ej * u.M_sun
     atomic_mass = atomic_mass * u.u
     # we calculate the density profile at t=1 day, and normalize it to 0.04 solar mass
-    rho_0 =  M_ej / (quad(dMdv, 0.1, 0.5, args=(1,))[0] * u.g/u.cm**3)
+    rho_0 =  M_ej / (quad(dMdv, 0.1, 0.5, args=1)[0] * u.g/u.cm**3)
     number_density_0 = (rho_0 * mass_fraction / atomic_mass).cgs.value
-    return lambda v, t: rho(v, t, number_density_0, power_law_exponent)
+    return lambda v, t: rho(v, t, number_density_0)
 
 # Environment class, contains all the parameters of the environment at a given time and radius, the inputs to the NLTE calculation
 # The following parameters are calculated from the input parameters:
@@ -129,36 +129,31 @@ class Environment:
     # calculated values (Will be calculated from the input values)
     spectrum : BlackBody = None # Experienced spectrum at the ROI. Contains the doppler shifted temperature
     T_electrons: float = None # K temperature of the electrons (doppler shifted photosphere temperature)
-    # default: (self.line_velocity/0.2)**-5 # Extracted from the paper, see electron_model_reconstruction.ipynb
-    n_e: float = 1.5e8 * line_velocity/0.284**-5 # count/cm^3	
+    n_e: float = None # count/cm^3	
     n_He: float = None # count/cm^3
-    q_dot: float = 1. # eV/s/ion
-    power_law_exponent: int = 5 # atomic density goes as v**-p
+    q_dot: float = None # eV/s/ion
     # Calculate derived values based on the input values
     def __post_init__(self):
         # Doppler shifted temperature according to the paper. Note that the paper incorrectly did not do this
         delta_v = self.line_velocity - self.photosphere_velocity
-        # commenting out the dopler shift reproduce Tarumi's results; t*(1+30*delta_v**2)
+        # commenting out the dopler shift reproduce Tarumi's results
         self.T_electrons = self.T_phot/(1/np.sqrt(1 - delta_v**2) * (1+delta_v)) # Doppler shifted temperature
         W = 0.5*(1-np.sqrt(1-(self.photosphere_velocity/self.line_velocity)**2)) # geometric dilution factor
         self.spectrum = BlackBody(self.T_electrons * u.K, scale=W*u.Unit("erg/(s Hz sr cm2)")) 
-        # I want to be able to provide the electron density without time dependence,
-        # and non-parametrically
-        # this allows it
-        self.n_e = (self.n_e * self.t_d**-3)
-        self.n_He = get_density_profile(self.M_ejecta, self.atomic_mass, self.mass_fraction, self.power_law_exponent)(self.line_velocity, self.t_d)
-        self.q_dot = self.q_dot * self.t_d**-1.3 # Radiative power of non-thermal electrons
+        self.n_e = (1.5e8*self.t_d**-3) * (self.line_velocity/0.284)**-5 # Extracted from the paper, see electron_model_reconstruction.ipynb
+        self.n_He = get_density_profile(self.M_ejecta, self.atomic_mass, self.mass_fraction)(self.line_velocity, self.t_d)
+        self.q_dot = 1 * self.t_d**-1.3 # Radiative power of non-thermal electrons
 
-def get_num_density(mass_fraction, env, power_law_exponent):
-    n_He = get_density_profile(env.M_ejecta, env.atomic_mass, mass_fraction, power_law_exponent)(env.line_velocity, env.t_d)
+def get_num_density(mass_fraction, env):
+    n_He = get_density_profile(env.M_ejecta, env.atomic_mass, mass_fraction)(env.line_velocity, env.t_d)
     if env.n_He != n_He:
         env.n_He = n_He
     # needed this to allow treating mass_fraction as a free parameter for fitting
     return n_He
     
-def estimate_tau(environment, states, y, A, mass_fraction, power_law_exponent):
+def estimate_tau(environment, states, y, A, mass_fraction):
     assert y.T.shape[0] == len(states.all_names)
-    n = y.T[:len(states.names)] * get_num_density(mass_fraction, environment, power_law_exponent) * u.cm**-3
+    n = y.T[:len(states.names)] * get_num_density(mass_fraction, environment) * u.cm**-3
     eps0 = 1/(4 * np.pi) # i dont like gauss units
     tau = np.zeros((len(n), len(n)))
     # The sobolev depth is calculated individually for each transition
@@ -197,7 +192,7 @@ def solve_NLTE_sob(environment, states, nlte_solver, mass_fraction, relaxation_s
 
     for _ in range(relaxation_steps):
         _, y = nlte_solver.solve(1e6)
-        tau = estimate_tau(environment, states, y[:,-1], radiative_process.A, mass_fraction, environment.power_law_exponent)
+        tau = estimate_tau(environment, states, y[:,-1], radiative_process.A, mass_fraction)
         if tau_prev is None:
             tau_prev = tau
         tau = (tau + tau_prev)/2
