@@ -252,7 +252,7 @@ if __name__ == "__main__":
 
     # put the telluric masks
     flux_min_grid = -5.5E-16 * np.ones(100)
-    flux_max_grid = 4E-16 * np.ones(100)
+    flux_max_grid = 6.5E-16 * np.ones(100)
     for (left, right) in telluric_cutouts_albert:
         horizontal_grid = np.linspace(left, right, 100)
         ax.fill_between(horizontal_grid, flux_max_grid, flux_min_grid, fc='silver', alpha=0.25)
@@ -260,20 +260,21 @@ if __name__ == "__main__":
     # now plot the spectra, blackbody + pcygni fits
     wavelength_grid = np.linspace(2500, 23000, 10_000) * u.AA
 
-    T_elec_epochs = {1.43: 4400,
-                    2.42: 3200,
-                    3.41: 2900,
-                    4.40: 2800}
+    T_elec_epochs = {1.12: 3800,
+                    1.43: 3500, # 4400
+                    2.42: 3200, # 3200
+                    3.41: 3200, # 2900
+                    4.40: 3100} # 2800
     
-    offsets = np.array([0., -2., -3.5, -5])*1E-16
-    scale = np.array([1.2, 2.5, 3., 3.5])
-    v_outs = [0.425, 0.35, 0.286, 0.271]
-    v_phots = [0.29, 0.23, 0.2, 0.17]#[0.236, 0.19, 0.18, 0.162]#[0.2, 0.13, 0.12, 0.11]
-    ve_s = [0.32] * 4 
-    v_refs = [0.2] * 4
-    mass_fractions = [0.3, 0.2, 0.3, 0.2]#[0.00045, 0.03, 0.15, 0.4]#[0.00055, 0.0015, 0.0075, 0.007]#[0.00008, 0.00004, 0.00015, 0.0002]
+    offsets = np.array([+2.8, -0.4, -2., -3.5, -5])*1E-16
+    scale = np.array([0.8, 1.5, 2.5, 3., 3.5])
+    v_outs = [0.45, 0.425, 0.35, 0.286, 0.23]
+    v_phots = [0.30, 0.29, 0.23, 0.2, 0.17]#[0.236, 0.19, 0.18, 0.162]#[0.2, 0.13, 0.12, 0.11]
+    ve_s = [0.32] * 5 
+    v_refs = [0.2] * 5
+    mass_fractions = [0.3, 0.3, 0.2, 0.3, 0.2]#[0.00045, 0.03, 0.15, 0.4]#[0.00055, 0.0015, 0.0075, 0.007]#[0.00008, 0.00004, 0.00015, 0.0002]
 
-    aayush_colors = mpl.colormaps['Spectral'](np.linspace(0, 1., len(T_elec_epochs)))
+    aayush_colors = ['slategray'] + list(mpl.colormaps['Spectral'](np.linspace(0, 1., len(T_elec_epochs)-1)))
     #misc.plot_ionization_temporal(np.array([4400, 3200, 2900, 2800]), np.array([1.43, 2.42, 3.41, 4.40]),
     #                       np.array(v_phots))
     #tau_wavelength = None
@@ -310,9 +311,11 @@ if __name__ == "__main__":
     tau_v = lambda v, vphot, tauref, ve: tauref*np.exp((vphot-v)/ve)
     #misc.plot_velocity_shells(T_elec_epochs.keys(), v_phots, v_outs, mass_fractions)
     
-    
-    
-    
+    salt_spec = np.loadtxt("./Spectral Series of AT2017gfo/1.17 days - SALT spectra/SALT_new_eg1_flux_calibrated_r+i.txt")
+    #ax.plot(anu_spec[:,0], anu_spec[:,1]*1e-17, ls='-', alpha=0.4, label='$0.92$ days')
+    #ax.plot(salt_spec[:,0], 0.7*salt_spec[:,1]+2e-16, alpha=0.8, lw=1, c='cornflowerblue', label='$t=1.12$ days')
+
+
     for i, (epoch, T_e) in enumerate(T_elec_epochs.items()):
         tau_shells = []
         v_shells = np.linspace(v_phots[i],0.5, 50)
@@ -333,8 +336,13 @@ if __name__ == "__main__":
         # TODO: unpaack  the results here
 
         print("COUNTING!: ", i, epoch, T_e)
-        colors = mpl.colormaps['coolwarm'](np.linspace(0, 1., len(T_elec_epochs)))
-        spec_ep = xshooter_data(day=epoch)
+        # 'plum', 'orchid', 'mediumpurple', 'mediumslateblue',
+        colors = ['mediumpurple'] + list(mpl.colormaps['coolwarm'](np.linspace(0, 1., len(T_elec_epochs)-1)))
+        if epoch >= 1.4:
+            spec_ep = xshooter_data(day=epoch)
+        # NOTE: Except for 1.12 day spectrum which is from SALT, not XShooter
+        elif epoch == 1.12:
+            spec_ep = salt_spec
         # sets the amplitude, etc. of the fitted blackbody 
         fitted_cont = utils.fit_blackbody(spec_ep[:,0], spec_ep[:,1], all_masked_regions)
         # only thing that needs to be tuned is then the mass_fraction
@@ -370,11 +378,6 @@ if __name__ == "__main__":
         shell_occ    = np.array(shell_occ)
         n_upper_grid   = np.array(n_up_grids)
         n_lower_grid   = np.array(n_lower_grid)
-        #tau_shells = np.array(tau_shells)
-        #n_upper_grid = np.array(n_upper_grid)
-        #n_lower_grid = np.array(n_lower_grid)
-        #for grid in [tau_shells, n_upper_grid, n_lower_grid]:
-        #    grid = np.array(grid)
 
         #print(tau_shells[0,:])
         #exit()
@@ -394,6 +397,14 @@ if __name__ == "__main__":
                             )
             line_transition_objects.append(line_transition)
         
+        # plot the observed spectrum
+        nan_mask = ~np.isnan(spec_ep[:, 1])
+        if epoch > 1.12:
+            ax.step(spec_ep[nan_mask,0], scale[i]*spec_ep[nan_mask,2]+ offsets[i], ls='-', color='darkgray', alpha=0.4, lw=0.75) #/fitted_cont.eval(wavelength_grid=spec_ep[:,0]) - i 
+        ax.step(spec_ep[nan_mask,0], scale[i]*spec_ep[nan_mask,1]+ offsets[i], ls='-', color=colors[i], lw=0.75,
+                          alpha=0.8, label=f'$t={epoch}$ days')
+        
+        # and then compute and plot synthetic spectrum
         photosphere = Photosphere(v_phot=(v_phots[i] * c),#.cgs.value, 
                                   v_max=(v_outs[i] * c),#.cgs.value,
                                   t_d=(epoch * u.day),#.cgs.value,
@@ -403,36 +414,39 @@ if __name__ == "__main__":
         full_wav_grid, spectrum_flux = photosphere.calc_spectrum()
         #exit()
         ax.plot(full_wav_grid, scale[i]*spectrum_flux + offsets[i], marker='.',
-                            ls='--', ms=1, c=aayush_colors[i], label=f"more physical model t={epoch}")
+                            ls='--', ms=1, c=aayush_colors[i], lw=1.) # ,label=f"more physical model t={epoch}"
         #    print(f"Line {res_lamb:.1f}nm
         #pcygni_line = lambda wav, vphot=v_phots[i], vout=v_outs[i]: blackbody_with_pcygnis(wav, tau_shells[0,:], resonance_wavelengths,
         #                            fitted_cont, t_0=(epoch * u.day).to('s'), v_out=vout, v_phot=vphot, ve=ve_s[i], display=False)
                             #environment=environment, states=SrII_states, level_occupancy=level_occupancy[:, -2:-1], A_rates=)
         #ax.plot(wavelength_grid, scale[i]*pcygni_line(wavelength_grid) + offsets[i], c='k', ls='-', lw=0.25)
+        ax.fill_between(full_wav_grid, scale[i]*spectrum_flux + offsets[i],
+                scale[i]*fitted_cont.eval(wavelength_grid=full_wav_grid) + offsets[i],
+                            fc='#ebc3d4', alpha=0.5) #ebc3d4
         #ax.fill_between(wavelength_grid.value, scale[i]*pcygni_line(wavelength_grid) + offsets[i],
         #        scale[i]*fitted_cont.eval(wavelength_grid=wavelength_grid) + offsets[i],
         #                    fc='#ebc3d4', alpha=0.5) #ebc3d4
         # place text stating X(Sr) at an appropriate height
-        desired_text_loc = 4_000
+        desired_text_loc = 3_900 # i know, weird choice of number
+        if epoch == 1.12:
+            desired_text_loc = 6200
         valid_flux = ~np.isnan(spec_ep[:, 1])  # Mask for valid flux values
         valid_indices = np.where(valid_flux)[0]  # Indices of valid flux
         closest_index = valid_indices[np.argmin(np.abs(spec_ep[valid_indices, 0] - desired_text_loc))]
         loc_flux = spec_ep[closest_index, 1]
 
-        ax.text(x=desired_text_loc, y=offsets[i] + loc_flux - 0.1E-16, ha='left',
+        ax.text(x=desired_text_loc, y=offsets[i] + loc_flux -0.1E-16, ha='left',
                       s='$X_{Sr}=' + f'{mass_fractions[i]*100:.3f} \%$', c=colors[i])
         ax.plot(wavelength_grid, scale[i]*fitted_cont.eval(wavelength_grid=wavelength_grid) + offsets[i],
                        ls='-', color='dimgray', #label=f"{T:.2f} $\pm$ {T_sigma:.2f}",
                        lw=0.5,)
-        nan_mask = ~np.isnan(spec_ep[:, 1])
-        ax.step(spec_ep[nan_mask,0], scale[i]*spec_ep[nan_mask,2]+ offsets[i], ls='-', color='darkgray', alpha=0.4, lw=0.75) #/fitted_cont.eval(wavelength_grid=spec_ep[:,0]) - i 
-        ax.step(spec_ep[nan_mask,0], scale[i]*spec_ep[nan_mask,1]+ offsets[i], ls='-', color=colors[i], lw=0.75,
-                          alpha=1., label=f'$t={epoch}$ days')
         # TODO: 
         #display_time_solution(t, level_occupancy, tau_all_timesteps, environment)
     ax.set_ylabel('Flux [erg s$^{-1}$ cm$^{-2}$ $\mathrm{\AA}^{-1}$]')
     ax.set_xlabel("Wavelength [$\mathrm{\AA}$]")
-    ax.legend(loc='upper right')
+    #ax.set_yticks([])
+    ax.set_ylim(top=7.5E-16)
+    ax.legend(loc='upper right', title='Time since explosion')
     #ax.set_xscale('log')
     plt.tight_layout()
     plt.savefig('fitted_cpygni.png', dpi=300)
