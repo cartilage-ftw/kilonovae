@@ -27,7 +27,7 @@ num_cores = mp.cpu_count()
 # There isn't any point in it using GPU when there aren't enough points to calculate.
 jax.config.update('jax_platform_name', 'cpu')
 jax.config.update('jax_num_cpu_devices', num_cores)
-print("Number of CPU cores available", jax.device_count())
+#print("Number of CPU cores available", jax.device_count())
 
 # I don't like cgs units, but we're doing astronomy so I have to live with it
 c = c.cgs.value
@@ -76,6 +76,7 @@ def S(p, z, r, r_min, r_max, v, g_u, g_l, n_u_grid, n_l_grid, v_grid, nu_0, cont
                     W(r, r_min)*continuum
                     )
 
+
 @partial(jax.tree_util.register_dataclass,
          data_fields=['tau_grid_eq', 'tau_grid_polar', 'velocity_grid',
                       'g_upper', 'g_lower', 'n_upper', 'n_lower'],
@@ -88,7 +89,7 @@ class LineTransition:
 
     When tau is needed for a specific r (or v), it returns the value by interpolating.
     """
-    wavelength: float
+    wavelength: Quantity
     tau_grid_eq: np.ndarray # shape same as len(velocity_grid)
     tau_grid_polar: np.ndarray
     velocity_grid: np.ndarray # in units of 'c'
@@ -122,11 +123,15 @@ def calc_z(p: float, t: float, delta: np.array):
 
     In impact geometry, this is a plane of constant 'z' along the observer line of sight
     """
-    # the location of the resonance plane
     # includes higher order relativistic corrections as per Hutchsemekers & Surdej
-    # I copied the expression from Albert's update
-    # TODO: there are NaN values in the output, need to check why
-    z = c*t*(delta**2/(1+delta**2) - delta**2/(1+delta**2) * (1+(1+delta**2)/delta**4*( (1-delta**2-(p/c/t)**2)))**(1/2))
+    # I copied the expression from Albert's update and made it more readable ;)
+    A = delta**2 / (1 + delta**2)
+    B = (1 + (1 + delta**2) / delta**4 * ((1 - delta**2 - (p/(c*t))**2)))**(1/2)
+    # NaN values may show up in 'B' if the square root factor in B becomes imaginary.
+    # This is only going to be when delta is unphysically large (e.g. calculating if a 400nm photon
+    # was redshifted to be in resonance with the 1 micron triplet; that's not happening even for v_max=c)
+    B = np.where(np.isnan(B), 0., B)
+    z = c * t * A * (1 - B)
     return z
 
 @jax.jit
@@ -174,7 +179,7 @@ class Photosphere:
         #self.v_phot = self.v_phot.to("cm/s").value
         #self.v_max = self.v_max.to("cm/s").value
         #self.t_d = self.t_d.to("s").value
-        print("Initializing Photosphere for lines", self.line_wavelengths*1e7)
+        #print("Initializing Photosphere for lines", self.line_wavelengths*1e7)
     
 
     def visualize_polar_region(self):
@@ -183,7 +188,7 @@ class Photosphere:
         v_max_circle = plt.Circle((0, 0), self.v_max/c, ec='w', ls=':', fill=False, alpha=1)
         p_list = np.linspace(-self.v_max/c, self.v_max/c, 500)
         z_list = np.linspace(-self.v_max/c, self.v_max/c, 500)#/(c*self.t_d)
-        z_0 = np.zeros_like(p_list)# * self.r_max#/(c*self.t_d)
+        p_0 = np.zeros_like(p_list)# * self.r_max#/(c*self.t_d)
         z_grid, p_grid = np.meshgrid(z_list, p_list)#/(c*self.t_d)
         r_grid = calc_r(p_grid, z_grid)
         is_polar = is_polar_ejecta(p_grid, z_grid, self.polar_opening_angle, self.observer_angle)
@@ -194,10 +199,10 @@ class Photosphere:
         ax.add_artist(v_phot_circle)
         ax.add_artist(v_max_circle)
 
-        ax.plot(p_list, z_0, c='w', lw=1, ls='--')
+        ax.plot(z_list, p_0, c='w', lw=1, ls='--')
         ax.text(0.7*self.v_phot/c, 0.02, s=r'$\to$', va='center', ha='center', color='w')
-        ax.set_xlabel("p (c)")
-        ax.set_ylabel("z (c)")
+        ax.set_xlabel("z (c)")
+        ax.set_ylabel("p (c)")
         plt.tight_layout()
         ax.set_aspect('equal')
         plt.show()
@@ -248,8 +253,7 @@ class Photosphere:
         _Si = jnp.array(_Si)[order]
         
         I_scat = jnp.sum(_Si * (1 - jnp.exp(-tau_i)) * jnp.exp(-jnp.cumsum(tau_i) + tau_i))
-        tau_tot = jnp.sum(tau_i)
-        I_abs = I(p, continuum, self.r_min)*jnp.exp(-tau_tot)
+        I_abs = I(p, continuum, self.r_min)*jnp.exp(-jnp.sum(tau_i))
         _Iemit = I_abs + I_scat
         return p * _Iemit
 
@@ -302,7 +306,7 @@ class Photosphere:
         #plt.show()
         return ~mask
 
-    def calc_spectrum(self, start_wav=3_500*u.AA, end_wav=22_500*u.AA, n_points=5000):
+    def calc_spectrum(self, start_wav=3_200*u.AA, end_wav=22_500*u.AA, n_points=5000):
         """
         I was thinking, if I pass v_phot and v_max here that can be used for a fitting routine
         it can be used to update v_phot and v_max set in the Photosphere object
