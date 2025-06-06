@@ -137,10 +137,14 @@ class Environment:
         # Doppler shifted temperature according to the paper. Note that the paper incorrectly did not do this
         delta_v = self.line_velocity - self.photosphere_velocity
         # commenting out the dopler shift reproduce Tarumi's results
-        self.T_electrons = self.T_phot/(1/np.sqrt(1 - delta_v**2) * (1+delta_v)) # Doppler shifted temperature
+        self.T_phot = self.T_phot/(1/np.sqrt(1 - delta_v**2) * (1+delta_v)) # Doppler shifted temperature
+        if self.T_electrons is None: # if not set as anything, let radiation temperature = electron tempearture
+            self.T_electrons = self.T_phot
+        else:
+            self.T_electrons = self.T_electrons#* (1 + self.line_velocity)**1.3#/(1/np.sqrt(1 - delta_v**2) * (1+delta_v))
         W = 0.5*(1-np.sqrt(1-(self.photosphere_velocity/self.line_velocity)**2)) # geometric dilution factor
-        self.spectrum = BlackBody(self.T_electrons * u.K, scale=W*u.Unit("erg/(s Hz sr cm2)")) 
-        self.n_e = (1.5e8*self.t_d**-3) * (self.line_velocity/0.284)**-5 # Extracted from the paper, see electron_model_reconstruction.ipynb
+        self.spectrum = BlackBody(self.T_phot * u.K, scale=W*u.Unit("erg/(s Hz sr cm2)")) 
+        self.n_e = (1.5e8*self.t_d**-3) * (self.line_velocity/0.2)**-5 # Extracted from the paper, see electron_model_reconstruction.ipynb
         self.n_He = get_density_profile(self.M_ejecta, self.atomic_mass, self.mass_fraction)(self.line_velocity, self.t_d)
         self.q_dot = 1 * self.t_d**-1.3 # Radiative power of non-thermal electrons
 
@@ -151,9 +155,13 @@ def get_num_density(mass_fraction, env):
     # needed this to allow treating mass_fraction as a free parameter for fitting
     return n_He
     
-def estimate_tau(environment, states, y, A, mass_fraction):
-    assert y.T.shape[0] == len(states.all_names)
-    n = y.T[:len(states.names)] * get_num_density(mass_fraction, environment) * u.cm**-3
+def estimate_tau(environment, states, y, A, mass_fraction, mode='non-LTE', srII_fraction='from-nLTE'):
+    if mode == 'non-LTE':
+        assert y.T.shape[0] == len(states.all_names)
+        n = y.T[:len(states.names)] * get_num_density(mass_fraction, environment) / u.cm**3
+    else:
+        # if LTE, then provide a SrII fraction from LTE ionization calc.        assert np.isfinite(srII_fraction)
+        n = y.T * srII_fraction * get_num_density(mass_fraction, environment) / u.cm**3
     eps0 = 1/(4 * np.pi) # i dont like gauss units
     tau = np.zeros((len(n), len(n)))
     # The sobolev depth is calculated individually for each transition
@@ -171,6 +179,32 @@ def estimate_tau(environment, states, y, A, mass_fraction):
     #print('unit of this thing is', xd.unit)
     return tau
 
+
+def estimate_LTE_tau(environment, states, level_pops, srII_fraction, radiative_process, mass_fraction, relaxation_steps=10):
+    # what fraction of it is Sr II? i.e. Sr II populations compared to Sr I, II, III, IV, V combined;
+    # estimated beforehand
+    # save the original rates
+    A = radiative_process.A 
+    #absorption_rate = radiative_process.arbsorbtion_rate
+    #stimulated_emission_rate = radiative_process.stimulated_emission_rate
+
+    # now calculate tau along with escape probability correction.
+    tau_prev = None
+    beta = 1
+    # perform a few relaxation steps to get the correct sobolev depth
+    for _ in range(relaxation_steps):
+        tau = estimate_tau(environment, states, level_pops, radiative_process.A, mass_fraction, 
+                                srII_fraction=srII_fraction,mode='LTE')
+        if tau_prev is None:
+            tau_prev = tau
+        tau = (tau + tau_prev)/2
+        tau_prev = tau
+        beta = np.array((1-np.exp(-tau)) / tau)
+        # due to "self-absorption", the effective transition rates are \beta times the true atomic rates
+        radiative_process.A = A * beta
+        #radiative_process.absorption_rate = absorption_rate * beta
+        #radiative_process.stimulated_emission_rate = stimulated_emission_rate * beta
+    return tau, beta
 
 # Solves the NLTE equations for the given environment and states
 # The solver uses the sobolev depth method to solve the NLTE equations
@@ -224,7 +258,7 @@ def solve_NLTE_sob(environment, states, nlte_solver, mass_fraction, relaxation_s
             # just make it a symmetric matrix to avoid confusion
             line_luminosities[j,i] = line_luminosities[i,j]'''
             
-    return t, occupancy_all, tau #tau_all_timesteps, line_luminosities#, nlte_solver
+    return t, occupancy_all, tau, beta #tau_all_timesteps, line_luminosities#, nlte_solver
         
 
 '''print("occupancy", occupancy_all[j,-1])
