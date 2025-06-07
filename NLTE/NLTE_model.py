@@ -129,11 +129,13 @@ class Environment:
     # calculated values (Will be calculated from the input values)
     spectrum : BlackBody = None # Experienced spectrum at the ROI. Contains the doppler shifted temperature
     T_electrons: float = None # K temperature of the electrons (doppler shifted photosphere temperature)
-    n_e: float = None # count/cm^3	
+    n_e: float = 1.5e8 # count/cm^3	
     n_He: float = None # count/cm^3
     q_dot: float = None # eV/s/ion
     # Calculate derived values based on the input values
     def __post_init__(self):
+        # the line velocity can never be lower than the photosphere velocity because of occultation
+        self.line_velocity = np.maximum(self.line_velocity, self.photosphere_velocity)
         # Doppler shifted temperature according to the paper. Note that the paper incorrectly did not do this
         delta_v = self.line_velocity - self.photosphere_velocity
         # commenting out the dopler shift reproduce Tarumi's results
@@ -144,7 +146,7 @@ class Environment:
             self.T_electrons = self.T_electrons#* (1 + self.line_velocity)**1.3#/(1/np.sqrt(1 - delta_v**2) * (1+delta_v))
         W = 0.5*(1-np.sqrt(1-(self.photosphere_velocity/self.line_velocity)**2)) # geometric dilution factor
         self.spectrum = BlackBody(self.T_phot * u.K, scale=W*u.Unit("erg/(s Hz sr cm2)")) 
-        self.n_e = (1.5e8*self.t_d**-3) * (self.line_velocity/0.2)**-5 # Extracted from the paper, see electron_model_reconstruction.ipynb
+        self.n_e *= (self.line_velocity/0.2)**-5 * self.t_d**-3 # Extracted from the paper, see electron_model_reconstruction.ipynb
         self.n_He = get_density_profile(self.M_ejecta, self.atomic_mass, self.mass_fraction)(self.line_velocity, self.t_d)
         self.q_dot = 1 * self.t_d**-1.3 # Radiative power of non-thermal electrons
 
@@ -190,7 +192,7 @@ def estimate_LTE_tau(environment, states, level_pops, srII_fraction, radiative_p
 
     # now calculate tau along with escape probability correction.
     tau_prev = None
-    beta = 1
+    beta = 999.
     # perform a few relaxation steps to get the correct sobolev depth
     for _ in range(relaxation_steps):
         tau = estimate_tau(environment, states, level_pops, radiative_process.A, mass_fraction, 

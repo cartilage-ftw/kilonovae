@@ -12,9 +12,10 @@ import numba
 import numpy as np
 import pandas as pd
 from astropy.constants import c, h, k_B, m_e
+from astropy.modeling import fitting
 from astropy.modeling.physical_models import BlackBody
 from astropy.units import Quantity
-from lmfit import Model
+from synphot.units import convert_flux
 from pathos.multiprocessing import ProcessingPool
 from scipy.integrate import quad
 from scipy.interpolate import interp1d
@@ -63,7 +64,7 @@ get_process = lambda solver, process: [p for p in solver.processes if isinstance
 get_rate_matrix = lambda solver, process: get_process(solver, process).get_transition_rate_matrix()
 
 # just used the same as albert; found elsewhere in the code
-telluric_cutouts_albert = np.array([
+telluric_cutouts = np.array([
     #[3000, 4500], # that's an absorption region
     #[5330, 5740], # I don't know why this is cut out from t=1.43d
     [6790, 6970], # NOTE: I chose this by visually looking at the spectra
@@ -75,12 +76,12 @@ telluric_cutouts_albert = np.array([
 # in a broader range than this
 
     # [9940, 10300], # why was this masked?
-    [12400, 12600],
-    [13100, 14950], # was 14360
-    [17550, 20050] # was 19000
+    [12400, 12700],
+    [13100, 14950], 
+    [17550, 20600]
 ])
 
-all_masked_regions = np.append(telluric_cutouts_albert,[
+all_masked_regions = np.append(telluric_cutouts,[
                             [3200, 4000],
                             (7000, 10500)
                         ], axis=0)
@@ -237,12 +238,52 @@ def load_strontium_line_data():
     # drop lines for all upper levels above max_energy_level
     SrII_lines_NIST = SrII_lines_NIST[SrII_lines_NIST['Ek(cm-1)'].astype(float) < MAX_ENERGY_LEVEL]
 
-from NLTE.NLTE_model import get_density_profile
+#@numba.njit
+def calc_spectrum_residuals(observed_spectrum, model_spectrum, model_wav_grids):
+    # to make it more appropriate, one can either interpolate between points in the model spectra
+    # or request the spectrum calculations to be done especially at points in the observed spectra.
+    
+    # evaluate the synthetic spectrum on the same grid as the observed spectrum
+    nan_free = ~np.isnan(observed_spectrum[:,1])
+
+    eval_range = [6500, 9800]
+    to_compare = np.where( nan_free &
+                                (observed_spectrum[:,0] > eval_range[0]) & 
+                                (observed_spectrum[:,0] < eval_range[1])
+                                 
+                            )[0]
+    
+    model_interp = interp1d(model_wav_grids, model_spectrum)(observed_spectrum[to_compare,0])
+    residuals = (observed_spectrum[to_compare,1] - model_interp)/observed_spectrum[to_compare,1]
+    
+    fig, axes = plt.subplots(2,1, figsize=(6,5), height_ratios=[4,1])
+    
+    axes[0].plot(observed_spectrum[to_compare,0], model_interp, label='interpolated')
+    #axes[0].plot(model_wav_grids, model_spectrum, label='synthetic')
+    axes[0].plot(observed_spectrum[to_compare,0], observed_spectrum[to_compare,1], label='observed')
+    axes[1].plot(observed_spectrum[to_compare,0], residuals)
+    axes[0].legend()
+    axes[0].set_yscale('log')
+    plt.tight_layout()
+    plt.show()
+    return np.sum(residuals**2)
+
+
+def display_spectrum_residuals(v_grid, ne_profiles, residuals):
+    """
+    Display what the different density profiles are like, colored by the residuals
+    """
+    fig, _ax = plt.subplots()
+    alphas = np.array(residuals)
+    # rescale between 0.2 and 1
+    alphas = np.interp(alphas, (alphas.min(), alphas.max()), [0.2,1])
+    print(alphas)
+    for i, profile in enumerate(ne_profiles):
+        _ax.plot(v_grid, profile, alpha=alphas[i], c='mediumpurple', label=f'{alphas[i]:.2f}')
+    _ax.set_yscale("log")
 
 M_ejecta = 0.04
 atomic_mass = 88
-
-
 
 tau_phots_epochs = []
 absorption_region = (7000, 9700)
@@ -256,7 +297,7 @@ if __name__ == "__main__":
     # put the telluric masks
     flux_min_grid = -5.5E-16 * np.ones(100)
     flux_max_grid = 6.5E-16 * np.ones(100)
-    for (left, right) in telluric_cutouts_albert:
+    for (left, right) in telluric_cutouts:
         horizontal_grid = np.linspace(left, right, 100)
         ax.fill_between(horizontal_grid, flux_max_grid, flux_min_grid, fc='silver', alpha=0.25)
   
@@ -276,7 +317,7 @@ if __name__ == "__main__":
     v_phots = [0.25, 0.19, 0.18, 0.18, 0.17]#[0.236, 0.19, 0.18, 0.162]#[0.2, 0.13, 0.12, 0.11]
     ve_s = [0.32] * 5 
     v_refs = [0.2] * 5
-    mass_fractions = [0.003, 0.0001, 0.0025, 0.1, 0.2]#[0.00045, 0.03, 0.15, 0.4]#[0.00055, 0.0015, 0.0075, 0.007]#[0.00008, 0.00004, 0.00015, 0.0002]
+    mass_fractions = 0.01 * np.ones_like(v_phots)#[0.003, 0.0001, 0.0025, 0.1, 0.2]#[0.00045, 0.03, 0.15, 0.4]#[0.00055, 0.0015, 0.0075, 0.007]#[0.00008, 0.00004, 0.00015, 0.0002]
 
     aayush_colors = ['slategray'] + list(mpl.colormaps['Spectral'](np.linspace(0, 1., len(T_elec_epochs)-1)))
     #misc.plot_ionization_temporal(np.array([4400, 3200, 2900, 2800]), np.array([1.43, 2.42, 3.41, 4.40]),
@@ -343,225 +384,241 @@ if __name__ == "__main__":
     #ax.plot(salt_spec[:,0], 0.7*salt_spec[:,1]+2e-16, alpha=0.8, lw=1, c='cornflowerblue', label='$t=1.12$ days')
 
 
-    for i, (epoch, T_e) in enumerate(T_elec_epochs.items()):
-        tau_shells = []
-        v_shells = np.linspace(v_phots[i],0.5, 100)
+    v_shells = np.linspace(0.1, 0.5, 100)
+    n_e = lambda ne_0, v_line, p=5: ne_0 * (v_line/0.2)**-p
+    ne_profile_1 = n_e(1.5e8, v_shells, p=5)
+    ne_profile_2 = n_e(1.5e8, v_shells, p=4)
+    ne_profile_3 = n_e(1.5e8, v_shells, p=8)
+    
+    ne_profiles = [ne_profile_1, ne_profile_2, ne_profile_3]
+    spectrum_residuals = np.zeros(len(ne_profiles))
 
-        env = Environment(t_d=1, T_phot=4400, mass_fraction=mass_fractions[i],
-                          atomic_mass=atomic_mass, photosphere_velocity=0.2,
-                          line_velocity=0.2, T_electrons=T_e)
+    for k, ne_profile in enumerate(ne_profiles):
+        for i, (epoch, T_e) in enumerate(T_elec_epochs.items()):
+            tau_shells = []
+            env = Environment(t_d=1, T_phot=4400, mass_fraction=mass_fractions[i],
+                            atomic_mass=atomic_mass, n_e = ne_profile[i], photosphere_velocity=0.2,
+                            line_velocity=0.2, T_electrons=T_e)
 
-        processes = [
-                    RadiativeProcess(SrII_states, env),
-                    CollisionProcess(SrII_states, env),
-                    HotElectronIonizationProcess(SrII_states, env),
-                    RecombinationProcess(SrII_states, env),
-                    # PhotoionizationProcess(SrII_states, env)
-                ]
-        #solver = NLTESolver(env, SrII_states, processes=processes)
-        #sr_coll_matr = get_rate_matrix(solver, CollisionProcess)
-        #sr_rad_matrix = get_rate_matrix(solver, RadiativeProcess)
-        #utils.display_rate_timescale(sr_rad_matrix, SrII_states.tex_names + ionization_stages_names,
-                        #                'Radiative', env)
-        #utils.display_rate_timescale(sr_coll_matr, SrII_states.tex_names + ionization_stages_names,
-                    #                'Collisional', env)
-        #exit()
-        #exit()
-
-        mp.context._force_start_method('spawn')
-        compute_tau_shell_worker = partial(_compute_tau_shell_sr,
-                                           epoch=epoch,
-                                           T_phot=T_phots[i],
-                                            T_electrons=T_e,
-                                            atomic_mass=88,
-                                            mass_fraction=mass_fractions[i],
-                                            v_phot=v_phots[i])
-
-        _compute_LTE_tau_worker = partial(compute_tau_LTE,
-                                          epoch=epoch, T_phot=T_phots[i],
-                                          mass_fraction=mass_fraction,
-                                          v_phot=v_phots[i]
-                                        )
-        with ProcessingPool(num_cores) as pool:
-            results = pool.map(compute_tau_shell_worker, v_shells)
-            lte_results = pool.map(_compute_LTE_tau_worker, v_shells)
-
-        # TODO: unpaack  the results here
-
-        print("COUNTING!: ", i, epoch, T_e)
-        # 'plum', 'orchid', 'mediumpurple', 'mediumslateblue',
-        colors = ['mediumpurple'] + list(mpl.colormaps['coolwarm'](np.linspace(0, 1., len(T_elec_epochs)-1)))
-        if epoch >= 1.4:
-            spec_ep = xshooter_data(day=epoch)
-        # NOTE: Except for 1.12 day spectrum which is from SALT, not XShooter
-        elif epoch == 1.12:
-            spec_ep = salt_spec
-
-        # sets the amplitude, etc. of the fitted blackbody 
-        T_bb = [6368.6,
-                5379.6 - 150,
-                3691.1,
-                3151.0,
-                2864.3]
-        fitted_cont = utils.fit_blackbody(spec_ep[:,0], spec_ep[:,1], all_masked_regions)
-        # only thing that needs to be tuned is then the mass_fraction
-        #fitted_spectral_line = utils.fit_planck_with_pcygni(spec_ep[:,0], spec_ep[:,1], telluric_cutouts_albert)
-        T = fitted_cont.params['T'].value
-        T_sigma = fitted_cont.params['T'].stderr
-        amplitude = fitted_cont.params['amplitude'].value
-
-        print(rf"Fitted blackbody temperature: {T:.1f} K")
-        # this continuum object will be passed to the line formation code.
-        continuum = BlackBody(temperature = T * u.K, scale=amplitude*u.Unit("1e20 * erg/(s sr cm2 AA)"))
-
-        
-        '''sr_coll_matr = get_rate_matrix(solver, CollisionProcess)
-            recombination_matrix = get_rate_matrix(solver, RecombinationProcess)
-            nonthermal_matrix = get_rate_matrix(solver, HotElectronIonizationProcess)
-            
-            utils.display_rate_timescale(recombination_matrix, SrII_states.tex_names + ionization_stages_names,
-                                    'Recombination', environment)
-            utils.display_rate_timescale(nonthermal_matrix, SrII_states.tex_names + ionization_stages_names,
-                                    'Non-thermal Ionization', environment)
-        '''
-        # plot the spatial profile of tau
-        if False:
-            misc.plot_tau_shells(tau_shells, tau_wavelength)
-            misc.plot_mean_ionization(v_shells, shell_occupancies, epoch)
-        print("At t=",epoch)
-        #misc.print_luminosities(SrII_states, line_luminosities, tau_shells)
-        #misc.print_line_things(SrII_states, v_shells, shell_occupancies, tau_shells)
-        #misc.compare_ionization_profile(v_shells, shell_occupancies, T, epoch)
-
-        # convert these list objects to a numpy array
-        tau_shells, escape_probs, shell_occ, g_upper, g_lower, n_up_grids, n_lower_grid, resonance_wavelengths = zip(*results)
-        tau_shells   = np.array(tau_shells)
-        shell_occ    = np.array(shell_occ)
-        n_upper_grid   = np.array(n_up_grids)
-        n_lower_grid   = np.array(n_lower_grid)
-        escape_probs = np.array(escape_probs)
-
-        tau_lte, escape_prob_lte, shell_occ, g_upper, g_lower, n_upper_lte, n_lower_lte, resonance_wavelengths = zip(*lte_results)
-        tau_lte = np.array(tau_lte)
-        n_upper_lte = np.array(n_upper_lte)
-        n_lower_lte = np.array(n_lower_lte)
-        escape_prob_lte = np.array(escape_prob_lte)
-        #print(f"Tau at photosphere at epoch {epoch}")
-        #print(tau_shells[0,:])
-        tau_phots_epochs.append(tau_shells[0,:])
-        #print("for lines", resonance_wavelengths[0])
-        #exit()
-        line_transition_objects = []
-        for j, line_wavelength in enumerate(resonance_wavelengths[0]):
-            # ignore forbidden lines that are too weak and will not be visible
-            if line_wavelength.to("nm").value > 2_000: continue
-            line_transition = LineTransition(
-                                    (line_wavelength),#.to("cm").value,
-                                    tau_shells[:,j], # equatorial ejecta np.zeros_like(tau_shells[:,j]),#
-                                    tau_shells[:,j], # polar ejecta
-                                    escape_probs[:,j],
-                                    escape_probs[:,j],
-                                    v_shells, 
-                                    g_upper[0][j], 
-                                    g_lower[0][j], 
-                                    n_upper_grid[:,j], 
-                                    n_lower_grid[:,j]
-                            )
-            line_transition_objects.append(line_transition)
-
-        lte_transition_objects = [
-                        LineTransition(
-                            (line_wavelength),
-                            tau_lte[:,j], # equatorial ejecta np.zeros_like(tau_shells[:,j]),#
-                            tau_lte[:,j], # polar ejecta
-                            escape_prob_lte[:,j],
-                            escape_prob_lte[:,j],
-                            v_shells, 
-                            g_upper[0][j], 
-                            g_lower[0][j], 
-                            n_upper_lte[:,j], 
-                            n_lower_lte[:,j]
-                        )
-                for j, line_wavelength in enumerate(resonance_wavelengths[0])
-                        if line_wavelength.to('nm').value < 2_000
-        ]
-        if True:
-            # plot the observed spectrum
-            nan_mask = ~np.isnan(spec_ep[:, 1])
-            if epoch > 1.12:
-                ax.step(spec_ep[nan_mask,0], scale[i]*spec_ep[nan_mask,2]+ offsets[i], ls='-', color='darkgray', alpha=0.4, lw=0.75) #/fitted_cont.eval(wavelength_grid=spec_ep[:,0]) - i 
-            ax.step(spec_ep[nan_mask,0], scale[i]*spec_ep[nan_mask,1]+ offsets[i], ls='-', color=colors[i], lw=0.75,
-                            alpha=0.8, label=f'$t={epoch}$ days')
-            
-            observer_angle = -np.pi/12 #+ np.pi/2 + np.pi/2 + np.pi/2 + np.pi/2
-            # and then compute and plot synthetic spectrum
-            photosphere = Photosphere(v_phot=(v_phots[i] * c),#.cgs.value, 
-                                    v_max=(v_outs[i] * c),#.cgs.value,
-                                    t_d=(epoch * u.day),#.cgs.value,
-                                    continuum=continuum,
-                                    line_list=line_transition_objects,
-                                    polar_opening_angle=np.pi/4,
-                                    observer_angle=observer_angle)
-            
-            lte_photosphere = Photosphere(v_phot=(v_phots[i] * c),#.cgs.value, 
-                                    v_max=(v_outs[i] * c),#.cgs.value,
-                                    t_d=(epoch * u.day),#.cgs.value,
-                                    continuum=continuum,
-                                    line_list=lte_transition_objects,
-                                    polar_opening_angle=np.pi/4,
-                                    observer_angle=observer_angle)
-            
-            full_wav_grid, spectrum_flux = photosphere.calc_spectrum()
-            #full_wav_grid, lte_spectrum_flux = lte_photosphere.calc_spectrum()
+            processes = [
+                        RadiativeProcess(SrII_states, env),
+                        CollisionProcess(SrII_states, env),
+                        HotElectronIonizationProcess(SrII_states, env),
+                        RecombinationProcess(SrII_states, env),
+                        # PhotoionizationProcess(SrII_states, env)
+                    ]
+            #solver = NLTESolver(env, SrII_states, processes=processes)
+            #sr_coll_matr = get_rate_matrix(solver, CollisionProcess)
+            #sr_rad_matrix = get_rate_matrix(solver, RadiativeProcess)
+            #utils.display_rate_timescale(sr_rad_matrix, SrII_states.tex_names + ionization_stages_names,
+                            #                'Radiative', env)
+            #utils.display_rate_timescale(sr_coll_matr, SrII_states.tex_names + ionization_stages_names,
+                        #                'Collisional', env)
             #exit()
-            ax.plot(full_wav_grid, scale[i]*spectrum_flux + offsets[i],# marker='.',
-                                ls='-.', ms=1, c=aayush_colors[i], lw=1)
-             # ,label=f"more physical model t={epoch}"
-            
-            #ax.plot(full_wav_grid, scale[i]*lte_spectrum_flux + offsets[i], marker='.',
-            #                    ls='-', ms=1, c=aayush_colors[i], lw=1.)
-            #    print(f"Line {res_lamb:.1f}nm
-            #pcygni_line = lambda wav, vphot=v_phots[i], vout=v_outs[i]: blackbody_with_pcygnis(wav, tau_shells[0,:], resonance_wavelengths,
-            #                            fitted_cont, t_0=(epoch * u.day).to('s'), v_out=vout, v_phot=vphot, ve=ve_s[i], display=False)
-                                #environment=environment, states=SrII_states, level_occupancy=level_occupancy[:, -2:-1], A_rates=)
-            #ax.plot(wavelength_grid, scale[i]*pcygni_line(wavelength_grid) + offsets[i], c='k', ls='-', lw=0.25)
-            ax.fill_between(full_wav_grid, scale[i]*spectrum_flux + offsets[i],
-                    scale[i]*fitted_cont.eval(wavelength_grid=full_wav_grid) + offsets[i],
-                                fc='#ebc3d4', alpha=0.5) #ebc3d4
-            #ax.fill_between(wavelength_grid.value, scale[i]*pcygni_line(wavelength_grid) + offsets[i],
-            #        scale[i]*fitted_cont.eval(wavelength_grid=wavelength_grid) + offsets[i],
-            #                    fc='#ebc3d4', alpha=0.5) #ebc3d4
-            # place text stating X(Sr) at an appropriate height
-            desired_text_loc = 3_900 # i know, weird choice of number
-            if epoch == 1.12:
-                desired_text_loc = 6200
-            valid_flux = ~np.isnan(spec_ep[:, 1])  # Mask for valid flux values
-            valid_indices = np.where(valid_flux)[0]  # Indices of valid flux
-            closest_index = valid_indices[np.argmin(np.abs(spec_ep[valid_indices, 0] - desired_text_loc))]
-            loc_flux = spec_ep[closest_index, 1]
+            #exit()
 
-            ax.text(x=desired_text_loc, y=offsets[i] + loc_flux -0.1E-16, ha='left',
-                        s='$X_{Sr}=' + f'{mass_fractions[i]*100:.3f} \%$', c=colors[i])
-            ax.plot(wavelength_grid, scale[i]*fitted_cont.eval(wavelength_grid=wavelength_grid) + offsets[i],
-                        ls='-', color='dimgray', #label=f"{T:.2f} $\pm$ {T_sigma:.2f}",
-                        lw=0.5,)
-            
-            # overplot Swift-UVOT photometry
-            if epoch == 1.12:
-                wav = [2243.15, 2593.87, 3464.83]
-                y_flux = np.array([5.3e-17, 2.67e-16, 3.51e-16])
-                y_max = [7.64e-17, 3.18e-16, 4.03e-16]
-                y_err = np.array(y_max) - np.array(y_flux)
-                x_range = abs(np.array([1977, 2223, 3041]) - np.array(wav)) 
-                ax.errorbar(wav, y_flux + offsets[i], yerr=y_err, xerr=x_range, marker='o',
-                                        c='mediumpurple', ls='', ms=3, capsize=2, alpha=0.7)
-            
-            #ax.set_ylim(top=5.5E-16, bottom=-1E-16)
+            mp.context._force_start_method('spawn')
+            compute_tau_shell_worker = partial(_compute_tau_shell_sr,
+                                            epoch=epoch,
+                                            T_phot=T_phots[i],
+                                                T_electrons=T_e,
+                                                atomic_mass=88,
+                                                mass_fraction=mass_fractions[i],
+                                                v_phot=v_phots[i])
 
-            #plt.savefig(f'fitted_cpygni_{observer_angle:.1f}.png', dpi=300)
-            #photosphere.visualize_polar_region()
-            # TODO: 
-            #display_time_solution(t, level_occupancy, tau_all_timesteps, environment)
+            _compute_LTE_tau_worker = partial(compute_tau_LTE,
+                                            epoch=epoch, T_phot=T_phots[i],
+                                            mass_fraction=mass_fraction,
+                                            v_phot=v_phots[i]
+                                            )
+            with ProcessingPool(num_cores) as pool:
+                results = pool.map(compute_tau_shell_worker, v_shells)
+                lte_results = pool.map(_compute_LTE_tau_worker, v_shells)
+
+            # TODO: unpaack  the results here
+
+            print("COUNTING!: ", i, epoch, T_e)
+            # 'plum', 'orchid', 'mediumpurple', 'mediumslateblue',
+            colors = ['mediumpurple'] + list(mpl.colormaps['coolwarm'](np.linspace(0, 1., len(T_elec_epochs)-1)))
+            if epoch >= 1.4:
+                spec_ep = xshooter_data(day=epoch)
+            # NOTE: Except for 1.12 day spectrum which is from SALT, not XShooter
+            elif epoch == 1.12:
+                spec_ep = salt_spec
+
+            # sets the amplitude, etc. of the fitted blackbody 
+            T_bb = [6368.6,
+                    5379.6 - 150,
+                    3691.1,
+                    3151.0,
+                    2864.3]
+            fitted_cont = utils.fit_blackbody(spec_ep[:,0], spec_ep[:,1], all_masked_regions)
+            #continuum_model = utils.BlackBodyFlux()
+            #fitter = fitting.LevMarLSQFitter()
+            #best_fit_continuum = fitter(continuum_model, spec_ep[:,0], spec_ep[:,1])
+            # only thing that needs to be tuned is then the mass_fraction
+            #fitted_spectral_line = utils.fit_planck_with_pcygni(spec_ep[:,0], spec_ep[:,1], telluric_cutouts_albert)
+            T = fitted_cont.params['T'].value
+            T_sigma = fitted_cont.params['T'].stderr
+            amplitude = np.pi * fitted_cont.params['amplitude'].value
+
+            print(rf"Fitted blackbody temperature: {T:.1f} K")
+            # this continuum object will be passed to the line formation code.
+            continuum = BlackBody(temperature = T * u.K, scale=amplitude*u.Unit("1e20 * erg/(s sr cm2 AA)"))
+
+            cont_F_lambda = fitted_cont.eval(wavelength_grid=wavelength_grid.value) * (1e-20 * u.erg/(u.s*u.cm**2*u.AA))
+            print("Units of F_Lambda", cont_F_lambda.unit)
+            cont_F_nu = convert_flux(wavelength_grid, cont_F_lambda, out_flux_unit='erg / (Hz s cm2)')
+            
+            '''sr_coll_matr = get_rate_matrix(solver, CollisionProcess)
+                recombination_matrix = get_rate_matrix(solver, RecombinationProcess)
+                nonthermal_matrix = get_rate_matrix(solver, HotElectronIonizationProcess)
+                
+                utils.display_rate_timescale(recombination_matrix, SrII_states.tex_names + ionization_stages_names,
+                                        'Recombination', environment)
+                utils.display_rate_timescale(nonthermal_matrix, SrII_states.tex_names + ionization_stages_names,
+                                        'Non-thermal Ionization', environment)
+            '''
+            # plot the spatial profile of tau
+            if False:
+                misc.plot_tau_shells(tau_shells, tau_wavelength)
+                misc.plot_mean_ionization(v_shells, shell_occupancies, epoch)
+            print("At t=",epoch)
+            #misc.print_luminosities(SrII_states, line_luminosities, tau_shells)
+            #misc.print_line_things(SrII_states, v_shells, shell_occupancies, tau_shells)
+            #misc.compare_ionization_profile(v_shells, shell_occupancies, T, epoch)
+
+            # convert these list objects to a numpy array
+            tau_shells, escape_probs, shell_occ, g_upper, g_lower, n_up_grids, n_lower_grid, resonance_wavelengths = zip(*results)
+            tau_shells   = np.array(tau_shells)
+            shell_occ    = np.array(shell_occ)
+            n_upper_grid   = np.array(n_up_grids)
+            n_lower_grid   = np.array(n_lower_grid)
+            escape_probs = np.array(escape_probs)
+
+            tau_lte, escape_prob_lte, shell_occ, g_upper, g_lower, n_upper_lte, n_lower_lte, resonance_wavelengths = zip(*lte_results)
+            tau_lte = np.array(tau_lte)
+            n_upper_lte = np.array(n_upper_lte)
+            n_lower_lte = np.array(n_lower_lte)
+            escape_prob_lte = np.array(escape_prob_lte)
+            #print(f"Tau at photosphere at epoch {epoch}")
+            #print(tau_shells[0,:])
+            tau_phots_epochs.append(tau_shells[0,:])
+            #print("for lines", resonance_wavelengths[0])
+            #exit()
+            line_transition_objects = []
+            for j, line_wavelength in enumerate(resonance_wavelengths[0]):
+                # ignore forbidden lines that are too weak and will not be visible
+                if line_wavelength.to("nm").value > 2_000: continue
+                line_transition = LineTransition(
+                                        (line_wavelength),#.to("cm").value,
+                                        tau_shells[:,j], # equatorial ejecta np.zeros_like(tau_shells[:,j]),#
+                                        tau_shells[:,j], # polar ejecta
+                                        escape_probs[:,j],
+                                        escape_probs[:,j],
+                                        v_shells, 
+                                        g_upper[0][j], 
+                                        g_lower[0][j], 
+                                        n_upper_grid[:,j], 
+                                        n_lower_grid[:,j]
+                                )
+                line_transition_objects.append(line_transition)
+
+            lte_transition_objects = [
+                            LineTransition(
+                                (line_wavelength),
+                                tau_lte[:,j], # equatorial ejecta np.zeros_like(tau_shells[:,j]),#
+                                tau_lte[:,j], # polar ejecta
+                                escape_prob_lte[:,j],
+                                escape_prob_lte[:,j],
+                                v_shells, 
+                                g_upper[0][j], 
+                                g_lower[0][j], 
+                                n_upper_lte[:,j], 
+                                n_lower_lte[:,j]
+                            )
+                    for j, line_wavelength in enumerate(resonance_wavelengths[0])
+                            if line_wavelength.to('nm').value < 2_000
+            ]
+            if True:
+                # plot the observed spectrum
+                nan_mask = ~np.isnan(spec_ep[:, 1])
+                if epoch > 1.12:
+                    ax.step(spec_ep[nan_mask,0], scale[i]*spec_ep[nan_mask,2]+ offsets[i], ls='-', color='darkgray', alpha=0.4, lw=0.75) #/fitted_cont.eval(wavelength_grid=spec_ep[:,0]) - i 
+                ax.step(spec_ep[nan_mask,0], scale[i]*spec_ep[nan_mask,1]+ offsets[i], ls='-', color=colors[i], lw=0.75,
+                                alpha=0.8, label=f'$t={epoch}$ days')
+                
+                observer_angle = -np.pi/12 #+ np.pi/2 + np.pi/2 + np.pi/2 + np.pi/2
+                # and then compute and plot synthetic spectrum
+                photosphere = Photosphere(v_phot=(v_phots[i] * c),#.cgs.value, 
+                                        v_max=(v_outs[i] * c),#.cgs.value,
+                                        t_d=(epoch * u.day),#.cgs.value,
+                                        continuum=continuum,
+                                        line_list=line_transition_objects,
+                                        polar_opening_angle=np.pi/4,
+                                        observer_angle=observer_angle)
+                
+                lte_photosphere = Photosphere(v_phot=(v_phots[i] * c),#.cgs.value, 
+                                        v_max=(v_outs[i] * c),#.cgs.value,
+                                        t_d=(epoch * u.day),#.cgs.value,
+                                        continuum=continuum,
+                                        line_list=lte_transition_objects,
+                                        polar_opening_angle=np.pi/4,
+                                        observer_angle=observer_angle)
+                
+                full_wav_grid, spectrum_flux = photosphere.calc_spectrum()
+                #full_wav_grid, lte_spectrum_flux = lte_photosphere.calc_spectrum()
+                #exit()
+                ax.plot(full_wav_grid, scale[i]*spectrum_flux + offsets[i],# marker='.',
+                                    ls='-.', ms=1, c=aayush_colors[i], lw=1)
+                # ,label=f"more physical model t={epoch}"
+                
+                #ax.plot(full_wav_grid, scale[i]*lte_spectrum_flux + offsets[i], marker='.',
+                #                    ls='-', ms=1, c=aayush_colors[i], lw=1.)
+                #    print(f"Line {res_lamb:.1f}nm
+                #pcygni_line = lambda wav, vphot=v_phots[i], vout=v_outs[i]: blackbody_with_pcygnis(wav, tau_shells[0,:], resonance_wavelengths,
+                #                            fitted_cont, t_0=(epoch * u.day).to('s'), v_out=vout, v_phot=vphot, ve=ve_s[i], display=False)
+                                    #environment=environment, states=SrII_states, level_occupancy=level_occupancy[:, -2:-1], A_rates=)
+                #ax.plot(wavelength_grid, scale[i]*pcygni_line(wavelength_grid) + offsets[i], c='k', ls='-', lw=0.25)
+                ax.fill_between(full_wav_grid, scale[i]*spectrum_flux + offsets[i],
+                        scale[i]*fitted_cont.eval(wavelength_grid=full_wav_grid) + offsets[i],
+                                    fc='#ebc3d4', alpha=0.5) #ebc3d4
+                
+                spectrum_residuals[k] += calc_spectrum_residuals(spec_ep, spectrum_flux, full_wav_grid)
+                #ax.fill_between(wavelength_grid.value, scale[i]*pcygni_line(wavelength_grid) + offsets[i],
+                #        scale[i]*fitted_cont.eval(wavelength_grid=wavelength_grid) + offsets[i],
+                #                    fc='#ebc3d4', alpha=0.5) #ebc3d4
+                # place text stating X(Sr) at an appropriate height
+                desired_text_loc = 3_900 # i know, weird choice of number
+                if epoch == 1.12:
+                    desired_text_loc = 6200
+                valid_flux = ~np.isnan(spec_ep[:, 1])  # Mask for valid flux values
+                valid_indices = np.where(valid_flux)[0]  # Indices of valid flux
+                closest_index = valid_indices[np.argmin(np.abs(spec_ep[valid_indices, 0] - desired_text_loc))]
+                loc_flux = spec_ep[closest_index, 1]
+
+                ax.text(x=desired_text_loc, y=offsets[i] + loc_flux -0.1E-16, ha='left',
+                            s='$X_{Sr}=' + f'{mass_fractions[i]*100:.3f} \%$', c=colors[i])
+                ax.plot(wavelength_grid, scale[i]*fitted_cont.eval(wavelength_grid=wavelength_grid) + offsets[i],
+                            ls='-', color='dimgray', #label=f"{T:.2f} $\pm$ {T_sigma:.2f}",
+                            lw=0.5,)
+                
+                # overplot Swift-UVOT photometry
+                if epoch == 1.12:
+                    wav = [2243.15, 2593.87, 3464.83]
+                    y_flux = np.array([5.3e-17, 2.67e-16, 3.51e-16])
+                    y_max = [7.64e-17, 3.18e-16, 4.03e-16]
+                    y_err = np.array(y_max) - np.array(y_flux)
+                    x_range = abs(np.array([1977, 2223, 3041]) - np.array(wav)) 
+                    ax.errorbar(wav, y_flux + offsets[i], yerr=y_err, xerr=x_range, marker='o',
+                                            c='mediumpurple', ls='', ms=3, capsize=2, alpha=0.7)
+                
+                #ax.set_ylim(top=5.5E-16, bottom=-1E-16)
+
+                #plt.savefig(f'fitted_cpygni_{observer_angle:.1f}.png', dpi=300)
+                #photosphere.visualize_polar_region()
+                # TODO: 
+                #display_time_solution(t, level_occupancy, tau_all_timesteps, environment)
     ax.set_ylabel('Flux [erg s$^{-1}$ cm$^{-2}$ $\mathrm{\AA}^{-1}$]')
     ax.set_xlabel("Wavelength [$\mathrm{\AA}$]")
     #ax.set_xscale('log')
@@ -573,6 +630,7 @@ if __name__ == "__main__":
     plt.tight_layout()
     plt.savefig(f'fitted_cpygni.png', dpi=300)
     
+    display_spectrum_residuals(v_shells, ne_profiles, spectrum_residuals)
     """
     _fig, _ax = plt.subplots()
     _ax.plot([1.12, 1.43, 2.42, 3.41, 4.40], np.array(tau_phots_epochs),
@@ -593,33 +651,3 @@ param_bounds = {
     'v_maxs': (),
     #'T_e': (),
 }
-
-@numba.njit
-def objective_function(X_Sr, log_ne_grid, v_phots, v_maxs):
-    """
-    An objective to be "maximized" by the Bayesian Optimizer.
-
-    Parameters
-    ---
-
-    X_Sr: mass fraction of strontium
-    log_ne_grid: a value of electron density
-    """
-
-@numba.njit
-def weight_function():
-    pass
-
-@numba.njit
-def spectrum_residuals(observed_spectra, model_spectra):
-    # to make it more appropriate, one can either interpolate between points in the model spectra
-    # or request the spectrum calculations to be done especially at points in the observed spectra.
-    # TODO: make sure the binning is the same and all that.
-    # if not, handle that here.
-    residuals = 0.
-    if fitting_range is None:
-        pass
-    for i in range(len(observed_spectra)):
-        to_compare_grid = np.ones_like(observed_spectra[i][:,0])
-        residuals += observed_spectra[i][to_compare_grid,1] - model_spectra[to_compare_grid,1]
-    return residuals
