@@ -14,6 +14,7 @@ import pandas as pd
 from astropy.constants import c, h, k_B, m_e
 from astropy.modeling import fitting
 from astropy.modeling.physical_models import BlackBody
+from astropy.modeling.powerlaws import SmoothlyBrokenPowerLaw1D
 from astropy.units import Quantity
 from synphot.units import convert_flux
 from pathos.multiprocessing import ProcessingPool
@@ -239,7 +240,7 @@ def load_strontium_line_data():
     SrII_lines_NIST = SrII_lines_NIST[SrII_lines_NIST['Ek(cm-1)'].astype(float) < MAX_ENERGY_LEVEL]
 
 #@numba.njit
-def calc_spectrum_residuals(observed_spectrum, model_spectrum, model_wav_grids):
+def calc_spectrum_residuals(observed_spectrum, model_spectrum, model_wav_grids, param_name_index):
     # to make it more appropriate, one can either interpolate between points in the model spectra
     # or request the spectrum calculations to be done especially at points in the observed spectra.
     
@@ -254,9 +255,9 @@ def calc_spectrum_residuals(observed_spectrum, model_spectrum, model_wav_grids):
                             )[0]
     
     model_interp = interp1d(model_wav_grids, model_spectrum)(observed_spectrum[to_compare,0])
-    residuals = (observed_spectrum[to_compare,1] - model_interp)/observed_spectrum[to_compare,1]
+    residuals = (observed_spectrum[to_compare,1] - model_interp)#/observed_spectrum[to_compare,1]
     
-    fig, axes = plt.subplots(2,1, figsize=(6,5), height_ratios=[4,1])
+    '''fig, axes = plt.subplots(2,1, figsize=(6,5), height_ratios=[4,1])
     
     axes[0].plot(observed_spectrum[to_compare,0], model_interp, label='interpolated')
     #axes[0].plot(model_wav_grids, model_spectrum, label='synthetic')
@@ -264,23 +265,32 @@ def calc_spectrum_residuals(observed_spectrum, model_spectrum, model_wav_grids):
     axes[1].plot(observed_spectrum[to_compare,0], residuals)
     axes[0].legend()
     axes[0].set_yscale('log')
+    axes[0].set_title("Density Profile: " + str(param_names[param_name_index]))
     plt.tight_layout()
-    plt.show()
+    plt.show()'''
     return np.sum(residuals**2)
 
 
-def display_spectrum_residuals(v_grid, ne_profiles, residuals):
+def display_spectrum_residuals(v_grid, ne_profiles, residuals, density_param_names):
     """
     Display what the different density profiles are like, colored by the residuals
     """
     fig, _ax = plt.subplots()
     alphas = np.array(residuals)
-    # rescale between 0.2 and 1
-    alphas = np.interp(alphas, (alphas.min(), alphas.max()), [0.2,1])
+    # rescale between 0.01 and 1.
+    alphas = np.interp(alphas, (alphas.min(), alphas.max()), [0.01,1])
     print(alphas)
+
+    colors = mpl.colormaps['Spectral'](np.linspace(0., 1., len(density_param_names)))
+    best = np.argmin(residuals)
     for i, profile in enumerate(ne_profiles):
-        _ax.plot(v_grid, profile, alpha=alphas[i], c='mediumpurple', label=f'{alphas[i]:.2f}')
+        _ax.plot(v_grid, profile, alpha=alphas[i], c='mediumpurple', label=density_param_names[i])
     _ax.set_yscale("log")
+    _ax.legend(ncols=1)
+    _ax.set_title("Best: " + str(density_param_names[best]))
+    _ax.set_xlabel("velocity [c]")
+    _ax.set_ylabel("$n_e$ at $t=1$ day")
+    #plt.savefig("different_power_laws.png", dpi=300)
 
 M_ejecta = 0.04
 atomic_mass = 88
@@ -313,22 +323,22 @@ if __name__ == "__main__":
     
     offsets = np.array([+2.8, -0.4, -2., -3.5, -5])*1E-16
     scale = np.array([0.8, 1.5, 2.5, 3., 3.5])
-    v_outs = [0.4, 0.4, 0.35, 0.256, 0.25]#[0.45, 0.425, 0.35, 0.286, 0.25]
-    v_phots = [0.25, 0.19, 0.18, 0.18, 0.17]#[0.236, 0.19, 0.18, 0.162]#[0.2, 0.13, 0.12, 0.11]
+    v_outs = [0.4, 0.4, 0.35, 0.3, 0.28]#[0.45, 0.425, 0.35, 0.286, 0.25]
+    v_phots = [0.25, 0.25, 0.22, 0.18, 0.16]#[0.236, 0.19, 0.18, 0.162]#[0.2, 0.13, 0.12, 0.11]
     ve_s = [0.32] * 5 
     v_refs = [0.2] * 5
-    mass_fractions = 0.01 * np.ones_like(v_phots)#[0.003, 0.0001, 0.0025, 0.1, 0.2]#[0.00045, 0.03, 0.15, 0.4]#[0.00055, 0.0015, 0.0075, 0.007]#[0.00008, 0.00004, 0.00015, 0.0002]
+    mass_fractions = 0.03 * np.ones_like(v_phots)#[0.003, 0.0001, 0.0025, 0.1, 0.2]#[0.00045, 0.03, 0.15, 0.4]#[0.00055, 0.0015, 0.0075, 0.007]#[0.00008, 0.00004, 0.00015, 0.0002]
 
     aayush_colors = ['slategray'] + list(mpl.colormaps['Spectral'](np.linspace(0, 1., len(T_elec_epochs)-1)))
     #misc.plot_ionization_temporal(np.array([4400, 3200, 2900, 2800]), np.array([1.43, 2.42, 3.41, 4.40]),
     #                       np.array(v_phots))
     #tau_wavelength = None
 
-    def _compute_tau_shell_sr(v_line, epoch, T_phot, T_electrons, mass_fraction, atomic_mass,
+    def _compute_tau_shell_sr(v_line, n_e, epoch, T_phot, T_electrons, mass_fraction, atomic_mass,
                            v_phot):
         #print("Initializing for line_velicity", v_line)
         env = Environment(t_d=epoch, T_phot=T_phot, mass_fraction=mass_fraction,
-                          atomic_mass=atomic_mass, photosphere_velocity=v_phot,
+                          atomic_mass=atomic_mass, n_e=n_e, photosphere_velocity=v_phot,
                           line_velocity=v_line, T_electrons=T_electrons)
 
         processes = [
@@ -353,11 +363,11 @@ if __name__ == "__main__":
     
 
     
-    def compute_tau_LTE(v_line, epoch, T_phot, mass_fraction, v_phot):
+    def compute_tau_LTE(v_line, n_e, epoch, T_phot, mass_fraction, v_phot):
         atomic_mass = 88
 
         env = Environment(t_d=epoch, T_phot=T_phot, mass_fraction=mass_fraction,
-                          atomic_mass=atomic_mass, photosphere_velocity=v_phot,
+                          atomic_mass=atomic_mass, n_e=n_e, photosphere_velocity=v_phot,
                           line_velocity=v_line, T_electrons=T_phot)
         rad_process = RadiativeProcess(SrII_states, env)
         
@@ -385,19 +395,41 @@ if __name__ == "__main__":
 
 
     v_shells = np.linspace(0.1, 0.5, 100)
+
+    broken_p_law = lambda a1, a2, amplitude=1e7, v_break=0.2, delta=0.01: SmoothlyBrokenPowerLaw1D(amplitude=amplitude,
+                                  x_break = v_break,
+                                  alpha_1= a1,
+                                  alpha_2 = a2,
+                                  delta=delta
+                                 )
     n_e = lambda ne_0, v_line, p=5: ne_0 * (v_line/0.2)**-p
-    ne_profile_1 = n_e(1.5e8, v_shells, p=5)
+
+
+    param_names = ['$p$=4', '$p$=8']
+    #ne_profile_1 = n_e(1.5e8, v_shells, p=5)
     ne_profile_2 = n_e(1.5e8, v_shells, p=4)
     ne_profile_3 = n_e(1.5e8, v_shells, p=8)
     
-    ne_profiles = [ne_profile_1, ne_profile_2, ne_profile_3]
-    spectrum_residuals = np.zeros(len(ne_profiles))
+    ne_profiles = [ne_profile_2, ne_profile_3]
+    a1_ = [2,3,4,5,7]
+    a2_ = [3,4,5,7,10]
+    for i,j in np.ndindex((3,3)):
+        ne_profiles.append(
+                broken_p_law(a1_[i], a2_[j])(v_shells)
+                )
+        param_names.append(f'$p_1$={a1_[i]}, $p_2$={a2_[j]}')
+        ne_profiles.append(
+            broken_p_law(a1_[i], a2_[j], v_break=0.25, amplitude=1e7)(v_shells)
+        )
+        param_names.append(f'$p_1$={a1_[i]}, $p_2$= {a2_[j]}, v_break=0.25')
 
-    for k, ne_profile in enumerate(ne_profiles):
+    spectrum_residuals = np.zeros(len(ne_profiles))
+    my_ne_profile = broken_p_law(2,8, v_break=0.25, amplitude=1e7)(v_shells)
+    for k, ne_profile in enumerate([my_ne_profile]):
         for i, (epoch, T_e) in enumerate(T_elec_epochs.items()):
             tau_shells = []
-            env = Environment(t_d=1, T_phot=4400, mass_fraction=mass_fractions[i],
-                            atomic_mass=atomic_mass, n_e = ne_profile[i], photosphere_velocity=0.2,
+            '''env = Environment(t_d=1, T_phot=4400, mass_fraction=mass_fractions[i],
+                            atomic_mass=atomic_mass, photosphere_velocity=0.2,
                             line_velocity=0.2, T_electrons=T_e)
 
             processes = [
@@ -406,7 +438,7 @@ if __name__ == "__main__":
                         HotElectronIonizationProcess(SrII_states, env),
                         RecombinationProcess(SrII_states, env),
                         # PhotoionizationProcess(SrII_states, env)
-                    ]
+                    ]'''
             #solver = NLTESolver(env, SrII_states, processes=processes)
             #sr_coll_matr = get_rate_matrix(solver, CollisionProcess)
             #sr_rad_matrix = get_rate_matrix(solver, RadiativeProcess)
@@ -432,14 +464,15 @@ if __name__ == "__main__":
                                             v_phot=v_phots[i]
                                             )
             with ProcessingPool(num_cores) as pool:
-                results = pool.map(compute_tau_shell_worker, v_shells)
-                lte_results = pool.map(_compute_LTE_tau_worker, v_shells)
+                results = pool.map(lambda params: compute_tau_shell_worker(*params), zip(v_shells, ne_profile))
+                lte_results = pool.map(lambda params: _compute_LTE_tau_worker(*params), zip(v_shells, ne_profile))
 
             # TODO: unpaack  the results here
 
             print("COUNTING!: ", i, epoch, T_e)
             # 'plum', 'orchid', 'mediumpurple', 'mediumslateblue',
             colors = ['mediumpurple'] + list(mpl.colormaps['coolwarm'](np.linspace(0, 1., len(T_elec_epochs)-1)))
+            # there's XShooter spectra for 1.4 day onwards
             if epoch >= 1.4:
                 spec_ep = xshooter_data(day=epoch)
             # NOTE: Except for 1.12 day spectrum which is from SALT, not XShooter
@@ -584,7 +617,7 @@ if __name__ == "__main__":
                         scale[i]*fitted_cont.eval(wavelength_grid=full_wav_grid) + offsets[i],
                                     fc='#ebc3d4', alpha=0.5) #ebc3d4
                 
-                spectrum_residuals[k] += calc_spectrum_residuals(spec_ep, spectrum_flux, full_wav_grid)
+                spectrum_residuals[k] += calc_spectrum_residuals(np.array(spec_ep), np.array(spectrum_flux), full_wav_grid, k)
                 #ax.fill_between(wavelength_grid.value, scale[i]*pcygni_line(wavelength_grid) + offsets[i],
                 #        scale[i]*fitted_cont.eval(wavelength_grid=wavelength_grid) + offsets[i],
                 #                    fc='#ebc3d4', alpha=0.5) #ebc3d4
@@ -619,6 +652,7 @@ if __name__ == "__main__":
                 #photosphere.visualize_polar_region()
                 # TODO: 
                 #display_time_solution(t, level_occupancy, tau_all_timesteps, environment)
+        #break
     ax.set_ylabel('Flux [erg s$^{-1}$ cm$^{-2}$ $\mathrm{\AA}^{-1}$]')
     ax.set_xlabel("Wavelength [$\mathrm{\AA}$]")
     #ax.set_xscale('log')
@@ -630,7 +664,7 @@ if __name__ == "__main__":
     plt.tight_layout()
     plt.savefig(f'fitted_cpygni.png', dpi=300)
     
-    display_spectrum_residuals(v_shells, ne_profiles, spectrum_residuals)
+    display_spectrum_residuals(v_shells, ne_profiles, spectrum_residuals, param_names)
     """
     _fig, _ax = plt.subplots()
     _ax.plot([1.12, 1.43, 2.42, 3.41, 4.40], np.array(tau_phots_epochs),
