@@ -14,6 +14,7 @@ from pathos.multiprocessing import ProcessingPool
 from scipy.integrate import quad
 from scipy.interpolate import interp1d
 from synphot.units import convert_flux
+from matplotlib.colors import ListedColormap
 
 """
 Does the PCygni line formation while taking into account the level populations,
@@ -65,7 +66,7 @@ def source_function(v, g_u, g_l, n_u_grid, n_l_grid, v_grid, nu_0,
 
 
 @njit(fastmath=True)
-def S(p, z, r, r_min, r_max, v, sob_esc_prob, g_u, g_l, n_u_grid, n_l_grid, v_grid, nu_0, continuum, mode='level-pop'):
+def S(p, z, r, r_min, r_max, v, sob_esc_prob, g_u, g_l, n_u_grid, n_l_grid, v_grid, nu_0, continuum, mode='classic'):
     abs_only_mode = False
     outside_photosphere = (r < r_min) | (r > r_max)
     occulted_region = (np.abs(p) < r_min) & (z < 0) 
@@ -78,7 +79,7 @@ def S(p, z, r, r_min, r_max, v, sob_esc_prob, g_u, g_l, n_u_grid, n_l_grid, v_gr
     else:
         return np.where(outside_photosphere | occulted_region,
                     1e-10,
-                    W(r, r_min)*continuum
+                    sob_esc_prob*W(r, r_min)*continuum
                     )
 
 @dataclass
@@ -176,7 +177,6 @@ class Photosphere:
         self.v_max = self.v_max.to("cm/s").value
         self.t_d = self.t_d.to("s").value
         print("Initializing Photosphere for lines", self.line_wavelengths*1e7,"nm")
-    
 
     def visualize_polar_region(self):
         fig, ax = plt.subplots()
@@ -189,8 +189,11 @@ class Photosphere:
         r_grid = calc_r(p_grid, z_grid)
         is_polar = is_polar_ejecta(p_grid, z_grid, self.polar_opening_angle, self.observer_angle)
         is_polar &= (r_grid) <= self.v_max/c
+        
+        trimmed_cmap = ListedColormap(plt.colormaps['coolwarm_r'](np.linspace(0.1,0.9,256)))
+        
         pos = ax.imshow(is_polar, extent=(-self.v_max/c, self.v_max/c, -self.v_max/c, self.v_max/c), 
-                        cmap='coolwarm_r', origin='lower')
+                        cmap=trimmed_cmap, origin='lower')
         fig.colorbar(pos, ax=ax,label='Polar Ejecta')
         ax.add_artist(v_phot_circle)
         ax.add_artist(v_max_circle)
@@ -205,13 +208,14 @@ class Photosphere:
         plt.show()
 
 
-    def tau(self, line, p, z, r,v):
+    def tau(self, line, p, z, r,v, is_polar):
         # including the relativistic correction for tau from Hutsemekers & Surdej (1990)
         mu = z / r
         beta = v/c
         corr = abs( (1-mu*beta)**2/( (1-beta)*(mu*(mu-beta)+(1-mu**2)*(1-beta**2))) )
+        
         # decide between polar and equatorial ejecta
-        tau_ = np.where(is_polar_ejecta(p,z, self.polar_opening_angle, self.observer_angle),
+        tau_ = np.where(is_polar,#is_polar_ejecta(p,z, self.polar_opening_angle, self.observer_angle),
                  corr*line._tau_interp_polar((v/c)),
                  corr*line._tau_interp_eq((v/c))
                  )
@@ -231,12 +235,25 @@ class Photosphere:
         """
         return np.where(np.abs(p) < self.v_phot * self.t_d, continuum, 0.)
 
-
-    def I_emit(self, p:float, nu:float, delta_arr: np.array, continuum: float):
+    
+    def I_emit(self, p:float, phi: float, nu:float, delta_arr: np.array, continuum: float):
         z_arr = calc_z(p, self.t_d, delta_arr)
         r_arr = calc_r(p, z_arr)
         v_arr = r_arr/self.t_d
         tau_i = []
+
+        # project to sky-plane coordinates
+        x = p * np.cos(phi)
+        y = p * np.sin(phi)
+
+
+        beta = self.observer_angle
+        # tilt, for the polar ejecta cone by the observer angle
+        x_rot = x * np.cos(beta) + z_arr*np.sin(beta)
+        y_rot = y
+        z_rot = -x * np.sin(beta) + z_arr * np.cos(beta)
+
+        inside_polar = np.abs(z_rot / r_arr) >= np.cos(self.polar_opening_angle/2)
 
         # For the scattering part, the line summation has to be done in the minus \hat{n} direction (i.e. going inwards
         # from observer's line of sight to the center of the explosion, instead of inside to out); see eqn (22) of Jeffrey & Branch (1990)
@@ -249,7 +266,7 @@ class Photosphere:
         S_i = lambda line, p, z, r, v: S(p, z, r, self.r_min, self.r_max, v, line.sob_esc_prob_eq(v/c), line.g_upper, line.g_lower, line.n_upper, line.n_lower, line.velocity_grid, line.nu_0, continuum)  
         
         for i, line in enumerate(np.array(self.line_list)[order]):
-            tau_i.append(self.tau(line, p, z_arr[order][i], r_arr[order][i], v_arr[order][i]))
+            tau_i.append(self.tau(line, p, z_arr[order][i], r_arr[order][i], v_arr[order][i], inside_polar[order][i]))
             I_scat += S_i(line, p, z_arr[order][i], r_arr[order][i], v_arr[order][i]) * (1-np.exp(-tau_i[i])) * np.exp(-np.sum(tau_i[:i-1]))
         
         return p * (self.I(p, continuum)*np.exp(-np.sum(tau_i)) + I_scat)
@@ -285,17 +302,26 @@ class Photosphere:
         if line_mask:
             return np.pi * self.r_min**2 * B_nu
         
+        N_phi = 32 # number of points in the phi grid
+        phi_grid = np.linspace(0, 2*np.pi, N_phi, endpoint=False)
+        dp = p_grid[1] - p_grid[0]
+        dphi = phi_grid[1] - phi_grid[0]
+        F_nu = 0.
+        for p in p_grid:
+            for phi in phi_grid:
+                _Iemit = self.I_emit(p, phi, nu, delta, B_nu)
+                F_nu += _Iemit * dp * dphi
         #t_i = time.time()
-        I_vals =  np.array([
-            self.I_emit(p, nu, delta, B_nu) for p in p_grid
-        ])
+        #I_vals =  np.array([
+        #    self.I_emit(p, nu, delta, B_nu) for p in p_grid
+        #])
         #y_extent = 2 * np.sqrt( np.maximum(self.r_max**2 - p_grid**2, 0.0) )
-        F_nu = np.trapz(2*np.pi* I_vals, p_grid)
+        #F_nu = np.trapz(2*np.pi* I_vals, p_grid)
         #F_nu = 2*np.pi*quad(self.I_emit, 0, self.r_max, args=(nu, delta, B_nu_grid[i]))[0]
         #print("Value of F_nu", F_nu)
         return F_nu
 
-    def calc_spectrum(self, start_wav=2350*u.AA, end_wav=22_500*u.AA, n_points=200):
+    def calc_spectrum(self, start_wav=2350*u.AA, end_wav=24_500*u.AA, n_points=200):
         """
         I was thinking, if I pass v_phot and v_max here that can be used for a fitting routine
         it can be used to update v_phot and v_max set in the Photosphere object
