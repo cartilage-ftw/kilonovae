@@ -292,7 +292,7 @@ class Photosphere:
         # immediate continuum case (because there are no lines to calculate)
         F_cont = jnp.pi * self.r_min**2 * B_nu
         def line_flux():
-            Nphi = 32
+            Nphi = 200
             phi = jnp.linspace(0.0, 2*jnp.pi, Nphi, endpoint=False)
             I_p_phi = jax.vmap(lambda p: jax.vmap(
                                     lambda phi: self.I_emit(p, phi, delta_arr, B_nu)
@@ -346,7 +346,7 @@ class Photosphere:
         #plt.show()
         return ~mask
 
-    def calc_spectrum(self, start_wav=2_350*u.AA, end_wav=24_500*u.AA, n_points=5000):
+    def calc_spectrum(self, start_wav=2_350*u.AA, end_wav=24_500*u.AA, n_points=2000):
         """
         I was thinking, if I pass v_phot and v_max here that can be used for a fitting routine
         it can be used to update v_phot and v_max set in the Photosphere object
@@ -380,21 +380,22 @@ class Photosphere:
         # in those parts, just return the continuum. This mask is used to decide that.
         line_masks = self.get_line_mask(nu_grid)
 
-        p_grid = np.linspace(0, self.r_max, 5000)
+        p_grid = np.linspace(0, self.r_max, 200)
         flat_continuum_grid = np.ones_like(B_nu_grid)
-        print("Starting flux integration!")
+        #print("Starting flux integration!")
         t_i = time.time()
         Fnu_list = self.calc_spectral_flux(nu_grid, line_masks, flat_continuum_grid, p_grid)
 
-        print(f"Time taken: {(time.time() - t_i):.3f} seconds for full spectrum calculation")
-        t_i = time.time()
+        
+        #t_i = time.time()
         #print("Devices: ", jax.devices(), "count: ", jax.device_count())
-        print("Preparing F_lambda")
+        #print("Preparing F_lambda")
         Fnu_list = np.array(Fnu_list) * B_nu_grid
         F_lambda = convert_flux(nu_grid * u.Hz, Fnu_list * Bnu_cgs_unit * u.sr, out_flux_unit='1e20 erg / (s AA cm2)')
         wavelength_grid = (lamb_grid).to("AA").value
-        print("Took", t_i - time.time(), "to prepare F_lambda")
-        print("Returning now!")
+        print(f"Time taken: {(time.time() - t_i):.3f} seconds for full spectrum calculation")
+        #print("Took", t_i - time.time(), "to prepare F_lambda")
+        #print("Returning now!")
         return wavelength_grid, F_lambda.value/(np.pi*self.r_min**2)
 
 
