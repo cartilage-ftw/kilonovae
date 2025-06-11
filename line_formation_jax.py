@@ -189,23 +189,34 @@ class Photosphere:
 
     def visualize_polar_region(self):
         fig, ax = plt.subplots()
+
         v_phot_circle = plt.Circle((0, 0), self.v_phot/c, ec='w',ls='--', fill=False, alpha=1)
         v_max_circle = plt.Circle((0, 0), self.v_max/c, ec='w', ls=':', fill=False, alpha=1)
+
         p_list = np.linspace(-self.v_max/c, self.v_max/c, 500)
         z_list = np.linspace(-self.v_max/c, self.v_max/c, 500)#/(c*self.t_d)
-        p_0 = np.zeros_like(p_list)# * self.r_max#/(c*self.t_d)
-        z_grid, p_grid = np.meshgrid(z_list, p_list)#/(c*self.t_d)
-        r_grid = calc_r(p_grid, z_grid)
-        is_polar = is_polar_ejecta(p_grid, z_grid, self.polar_opening_angle, self.observer_angle)
-        is_polar &= (r_grid) <= self.v_max/c
-        pos = ax.imshow(is_polar, extent=(-self.v_max/c, self.v_max/c, -self.v_max/c, self.v_max/c), 
+
+        Z, P = np.meshgrid(z_list, p_list)#/(c*self.t_d)
+        R = calc_r(P, Z)
+
+        X = P
+        Y = np.zeros_like(X) # a meridonial slice along \phi=0
+
+        inside_polar = self.is_polar(X, Y, Z, R)#is_polar_ejecta(P, Z, self.polar_opening_angle, self.observer_angle)
+        inside_polar &= (R) <= self.v_max/c
+
+        pos = ax.imshow(inside_polar, extent=(-self.v_max/c, self.v_max/c, -self.v_max/c, self.v_max/c), 
                         cmap='coolwarm_r', origin='lower')
         fig.colorbar(pos, ax=ax,label='Polar Ejecta')
+        
         ax.add_artist(v_phot_circle)
         ax.add_artist(v_max_circle)
 
+        p_0 = np.zeros_like(p_list)# * self.r_max#/(c*self.t_d)
         ax.plot(z_list, p_0, c='w', lw=1, ls='--')
+
         ax.text(0.7*self.v_phot/c, 0.02, s=r'$\to$', va='center', ha='center', color='w')
+        
         ax.set_xlabel("z (c)")
         ax.set_ylabel("p (c)")
         plt.tight_layout()
