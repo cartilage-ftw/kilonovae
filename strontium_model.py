@@ -26,7 +26,7 @@ import NLTE.collision_rates
 import NLTE.NLTE_model
 import util.atomic_utils as atomic_utils
 import util.utils as utils
-from line_formation import LineTransition, Photosphere
+from line_formation_jax import LineTransition, Photosphere
 from NLTE.NLTE_model import (CollisionProcess, Environment,
                              HotElectronIonizationProcess, NLTESolver,
                              PhotoionizationProcess, RadiativeProcess,
@@ -71,7 +71,7 @@ telluric_cutouts = np.array([
     [6790, 6970], # NOTE: I chose this by visually looking at the spectra
     #[7070, 7300], # same as above
     [7490, 7650], # also same; NOTE: remember that telluric subtraction can be wrong
-    [8850, 9700],
+    [9150, 9700],
     [10950, 11600],
 # I have been a bit generous in the choice, although the subtraction distorts the continuum
 # in a broader range than this
@@ -240,7 +240,8 @@ def load_strontium_line_data():
     SrII_lines_NIST = SrII_lines_NIST[SrII_lines_NIST['Ek(cm-1)'].astype(float) < MAX_ENERGY_LEVEL]
 
 #@numba.njit
-def calc_spectrum_residuals(observed_spectrum, model_spectrum, model_wav_grids, param_name_index):
+def calc_spectrum_residuals(observed_spectrum, model_spectrum, model_wav_grids, param_name_index,
+                            to_show_residuals=False):
     # to make it more appropriate, one can either interpolate between points in the model spectra
     # or request the spectrum calculations to be done especially at points in the observed spectra.
     
@@ -257,21 +258,23 @@ def calc_spectrum_residuals(observed_spectrum, model_spectrum, model_wav_grids, 
     model_interp = interp1d(model_wav_grids, model_spectrum)(observed_spectrum[to_compare,0])
     residuals = (observed_spectrum[to_compare,1] - model_interp)#/observed_spectrum[to_compare,1]
     
-    '''fig, axes = plt.subplots(2,1, figsize=(6,5), height_ratios=[4,1])
+    if to_show_residuals:
+        fig, axes = plt.subplots(2,1, figsize=(6,5), height_ratios=[4,1])
     
-    axes[0].plot(observed_spectrum[to_compare,0], model_interp, label='interpolated')
-    #axes[0].plot(model_wav_grids, model_spectrum, label='synthetic')
-    axes[0].plot(observed_spectrum[to_compare,0], observed_spectrum[to_compare,1], label='observed')
-    axes[1].plot(observed_spectrum[to_compare,0], residuals)
-    axes[0].legend()
-    axes[0].set_yscale('log')
-    axes[0].set_title("Density Profile: " + str(param_names[param_name_index]))
-    plt.tight_layout()
-    plt.show()'''
+        axes[0].plot(observed_spectrum[to_compare,0], model_interp, label='interpolated')
+        #axes[0].plot(model_wav_grids, model_spectrum, label='synthetic')
+        axes[0].plot(observed_spectrum[to_compare,0], observed_spectrum[to_compare,1], label='observed')
+        axes[1].plot(observed_spectrum[to_compare,0], residuals)
+        axes[0].legend()
+        axes[0].set_yscale('log')
+        axes[0].set_title("Density Profile: " + str(param_names[param_name_index]))
+        plt.tight_layout()
+        plt.show()
+
     return np.sum(residuals**2)
 
 
-def display_spectrum_residuals(v_grid, ne_profiles, residuals, density_param_names):
+def display_best_fit_density_profiles(v_grid, ne_profiles, residuals, density_param_names):
     """
     Display what the different density profiles are like, colored by the residuals
     """
@@ -304,33 +307,49 @@ if __name__ == "__main__":
 
     fig, ax = plt.subplots(figsize=(8,6))
 
+    T_elec_epochs = {1.17: 5200,
+                    1.43: 4400, # 4400
+                    2.42: 3200, # 3200
+                    3.41: 2900, # 2900
+                    4.40: 2700} # 2800
+    aayush_colors = ['slategray'] + list(mpl.colormaps['Spectral'](np.linspace(0, 1., len(T_elec_epochs)-1)))
+
     # put the telluric masks
     flux_min_grid = -5.5E-16 * np.ones(100)
     flux_max_grid = 6.5E-16 * np.ones(100)
     for (left, right) in telluric_cutouts:
         horizontal_grid = np.linspace(left, right, 100)
         ax.fill_between(horizontal_grid, flux_max_grid, flux_min_grid, fc='silver', alpha=0.25)
-  
+    
+    triplets = np.array([10917.8, 10039.4, 10330.14])
+    # mark the rest wavelength
+    #ax.vlines(triplets, np.min(flux_min_grid), np.max(flux_max_grid),
+    #                     ls='--', lw=1., ec='k', alpha=0.8)
+
+    '''for (left, right) in [[6900, 11900]]:
+        horizontal_grid = np.linspace(left, right, 100)
+        f_max_grid = 4e-16*np.ones_like(horizontal_grid)
+        f_min_grid = -2e-16*np.ones_like(horizontal_grid)
+        ax.fill_between(horizontal_grid, f_max_grid, f_min_grid, fc='silver', alpha=0.25)
+        ax.text(9_000, -1e-16,r"1$\mu$m feature", c='dimgray', ha='center', va='center')
+        ax.vlines([left, right], ymin=-2e-16, ymax=4e-16, ec='silver', alpha=0.6)'''
     # now plot the spectra, blackbody + pcygni fits
     wavelength_grid = np.linspace(2350, 23000, 10_000) * u.AA
 
     T_phots = [5200, 4400, 3200, 2900, 2800]
-    T_elec_epochs = {1.12: 5200,
-                    1.43: 4400, # 4400
-                    2.42: 3200, # 3200
-                    3.41: 2900, # 2900
-                    4.40: 2700} # 2800
+
     
     offsets = np.array([+2.8, -0.4, -2., -3.5, -5])*1E-16
     scale = np.array([0.8, 1.5, 2.5, 3., 3.5])
-    v_outs = [0.4, 0.4, 0.35, 0.3, 0.28]#[0.45, 0.425, 0.35, 0.286, 0.25]
-    v_phots = [0.25, 0.25, 0.22, 0.18, 0.16]#[0.236, 0.19, 0.18, 0.162]#[0.2, 0.13, 0.12, 0.11]
+    #v_outs = [0.4, 0.4, 0.35, 0.3, 0.28]#[0.45, 0.425, 0.35, 0.286, 0.25]
+    v_outs = [0.42, 0.42, 0.35, 0.28, 0.26]
+    v_phots = [0.25, 0.24, 0.21, 0.17, 0.15]
+    #v_phots = [0.26, 0.24, 0.22, 0.18, 0.16]#[0.236, 0.19, 0.18, 0.162]#[0.2, 0.13, 0.12, 0.11]
     ve_s = [0.32] * 5 
     v_refs = [0.2] * 5
-    mass_fractions = 0.03 * np.ones_like(v_phots)#[0.003, 0.0001, 0.0025, 0.1, 0.2]#[0.00045, 0.03, 0.15, 0.4]#[0.00055, 0.0015, 0.0075, 0.007]#[0.00008, 0.00004, 0.00015, 0.0002]
+    mass_fractions = 0.015 * np.ones_like(v_phots)#[0.003, 0.0001, 0.0025, 0.1, 0.2]#[0.00045, 0.03, 0.15, 0.4]#[0.00055, 0.0015, 0.0075, 0.007]#[0.00008, 0.00004, 0.00015, 0.0002]
 
-    aayush_colors = ['slategray'] + list(mpl.colormaps['Spectral'](np.linspace(0, 1., len(T_elec_epochs)-1)))
-    #misc.plot_ionization_temporal(np.array([4400, 3200, 2900, 2800]), np.array([1.43, 2.42, 3.41, 4.40]),
+        #misc.plot_ionization_temporal(np.array([4400, 3200, 2900, 2800]), np.array([1.43, 2.42, 3.41, 4.40]),
     #                       np.array(v_phots))
     #tau_wavelength = None
 
@@ -389,9 +408,10 @@ if __name__ == "__main__":
     tau_v = lambda v, vphot, tauref, ve: tauref*np.exp((vphot-v)/ve)
     #misc.plot_velocity_shells(T_elec_epochs.keys(), v_phots, v_outs, mass_fractions)
     
+    anu_spec[:,1] *= 1e-17
     salt_spec = np.loadtxt("./Spectral Series of AT2017gfo/1.17 days - SALT spectra/SALT_new_eg1_flux_calibrated_r+i.txt")
-    #ax.plot(anu_spec[:,0], anu_spec[:,1]*1e-17, ls='-', alpha=0.4, label='$0.92$ days')
-    #ax.plot(salt_spec[:,0], 0.7*salt_spec[:,1]+2e-16, alpha=0.8, lw=1, c='cornflowerblue', label='$t=1.12$ days')
+    #ax.plot(anu_spec[:,0], anu_spec[:,1], ls='-', alpha=0.4, label='$0.92$ days')
+    #ax.plot(salt_spec[:,0], 0.7*salt_spec[:,1]+2e-16, alpha=0.8, lw=1, c='cornflowerblue', label='$t=1.17$ days')
 
 
     v_shells = np.linspace(0.1, 0.5, 100)
@@ -424,8 +444,10 @@ if __name__ == "__main__":
         param_names.append(f'$p_1$={a1_[i]}, $p_2$= {a2_[j]}, v_break=0.25')
 
     spectrum_residuals = np.zeros(len(ne_profiles))
-    my_ne_profile = broken_p_law(2,8, v_break=0.25, amplitude=1e7)(v_shells)
-    for k, ne_profile in enumerate([my_ne_profile]):
+    #my_ne_profile = broken_p_law(2,7, v_break=0.25, amplitude=1e7)(v_shells)
+    my_ne_profile = broken_p_law(2,7, v_break=0.2, amplitude=1e7)(v_shells)
+    my_ne_profile2 = broken_p_law(3,10, v_break=0.23, amplitude=5e6)(v_shells)
+    for k, ne_profile in enumerate([my_ne_profile2]):
         for i, (epoch, T_e) in enumerate(T_elec_epochs.items()):
             tau_shells = []
             '''env = Environment(t_d=1, T_phot=4400, mass_fraction=mass_fractions[i],
@@ -438,12 +460,13 @@ if __name__ == "__main__":
                         HotElectronIonizationProcess(SrII_states, env),
                         RecombinationProcess(SrII_states, env),
                         # PhotoionizationProcess(SrII_states, env)
-                    ]'''
-            #solver = NLTESolver(env, SrII_states, processes=processes)
+                    ]
+            solver = NLTESolver(env, SrII_states, processes=processes)
             #sr_coll_matr = get_rate_matrix(solver, CollisionProcess)
             #sr_rad_matrix = get_rate_matrix(solver, RadiativeProcess)
-            #utils.display_rate_timescale(sr_rad_matrix, SrII_states.tex_names + ionization_stages_names,
-                            #                'Radiative', env)
+            sr_nonthermal_matrix = get_rate_matrix(solver, RecombinationProcess)
+            utils.display_rate_timescale(sr_nonthermal_matrix, SrII_states,
+                                            'Nonthermal Ionization', env)'''
             #utils.display_rate_timescale(sr_coll_matr, SrII_states.tex_names + ionization_stages_names,
                         #                'Collisional', env)
             #exit()
@@ -472,19 +495,31 @@ if __name__ == "__main__":
             print("COUNTING!: ", i, epoch, T_e)
             # 'plum', 'orchid', 'mediumpurple', 'mediumslateblue',
             colors = ['mediumpurple'] + list(mpl.colormaps['coolwarm'](np.linspace(0, 1., len(T_elec_epochs)-1)))
+            
+            mark_offsets = [-0.9E-16, 0., -2.5E-17, -0.7E-16, -0.9E-16]
+            # mark the Sr II triplets
+            if False: 
+                ax.vlines(triplets * (1-v_phots[i]), 2e-16 + offsets[i] + mark_offsets[i],
+                                     3e-16 + offsets[i] + mark_offsets[i],lw=1,
+                            ls='--',ec=colors[i], alpha=0.6)
+                #a_left, a_right, a_ht, a_vertical = (triplets[0], (-v_phots[i])*triplets[0], offsets[i],0.)
+                #ax.arrow(a_left, a_right, a_ht, a_vertical)
+                #ax.annotate("", xytext=(0, 0), xy=(triplets[0], offsets[i]), arrowprops=dict(arrowstyle="<-"))
+            
             # there's XShooter spectra for 1.4 day onwards
             if epoch >= 1.4:
                 spec_ep = xshooter_data(day=epoch)
-            # NOTE: Except for 1.12 day spectrum which is from SALT, not XShooter
-            elif epoch == 1.12:
+            # NOTE: Except for 1.17 day spectrum which is from SALT, not XShooter
+            elif epoch == 1.17:
                 spec_ep = salt_spec
-
+            elif epoch == 0.92:
+                spec_ep = anu_spec
             # sets the amplitude, etc. of the fitted blackbody 
-            T_bb = [6368.6,
-                    5379.6 - 150,
-                    3691.1,
-                    3151.0,
-                    2864.3]
+            #T_bb = [6368.6,
+            #        5379.6, #- 150,
+            #        3691.1,
+            #        3151.0,
+            #        2864.3]
             fitted_cont = utils.fit_blackbody(spec_ep[:,0], spec_ep[:,1], all_masked_regions)
             #continuum_model = utils.BlackBodyFlux()
             #fitter = fitting.LevMarLSQFitter()
@@ -494,14 +529,14 @@ if __name__ == "__main__":
             T = fitted_cont.params['T'].value
             T_sigma = fitted_cont.params['T'].stderr
             amplitude = np.pi * fitted_cont.params['amplitude'].value
-
+            print("Value of amplitude:", amplitude)
+            print("Calculated luminosity distance:",
+                   utils.calc_luminosity_distance(amplitude/np.pi, v_phots[i] * c, epoch * u.day))
             print(rf"Fitted blackbody temperature: {T:.1f} K")
+            
+            flux_scale_amplitude = amplitude * 1e-20
             # this continuum object will be passed to the line formation code.
-            continuum = BlackBody(temperature = T * u.K, scale=amplitude*u.Unit("1e20 * erg/(s sr cm2 AA)"))
-
-            cont_F_lambda = fitted_cont.eval(wavelength_grid=wavelength_grid.value) * (1e-20 * u.erg/(u.s*u.cm**2*u.AA))
-            print("Units of F_Lambda", cont_F_lambda.unit)
-            cont_F_nu = convert_flux(wavelength_grid, cont_F_lambda, out_flux_unit='erg / (Hz s cm2)')
+            continuum = BlackBody(temperature = T * u.K, scale=1*u.Unit("erg/(s cm2 Hz sr)"))
             
             '''sr_coll_matr = get_rate_matrix(solver, CollisionProcess)
                 recombination_matrix = get_rate_matrix(solver, RecombinationProcess)
@@ -519,7 +554,7 @@ if __name__ == "__main__":
             print("At t=",epoch)
             #misc.print_luminosities(SrII_states, line_luminosities, tau_shells)
             #misc.print_line_things(SrII_states, v_shells, shell_occupancies, tau_shells)
-            #misc.compare_ionization_profile(v_shells, shell_occupancies, T, epoch)
+            
 
             # convert these list objects to a numpy array
             tau_shells, escape_probs, shell_occ, g_upper, g_lower, n_up_grids, n_lower_grid, resonance_wavelengths = zip(*results)
@@ -529,7 +564,9 @@ if __name__ == "__main__":
             n_lower_grid   = np.array(n_lower_grid)
             escape_probs = np.array(escape_probs)
 
-            tau_lte, escape_prob_lte, shell_occ, g_upper, g_lower, n_upper_lte, n_lower_lte, resonance_wavelengths = zip(*lte_results)
+            #misc.compare_ionization_profile(v_shells, SrII_states, shell_occ, T, epoch)
+            
+            tau_lte, escape_prob_lte, shell_occ_lte, g_upper, g_lower, n_upper_lte, n_lower_lte, resonance_wavelengths = zip(*lte_results)
             tau_lte = np.array(tau_lte)
             n_upper_lte = np.array(n_upper_lte)
             n_lower_lte = np.array(n_lower_lte)
@@ -544,8 +581,8 @@ if __name__ == "__main__":
                 # ignore forbidden lines that are too weak and will not be visible
                 if line_wavelength.to("nm").value > 2_000: continue
                 line_transition = LineTransition(
-                                        (line_wavelength),#.to("cm").value,
-                                        tau_shells[:,j], # equatorial ejecta np.zeros_like(tau_shells[:,j]),#
+                                        (line_wavelength).to("cm").value,
+                                        tau_shells[:,j],#np.zeros_like(tau_shells[:,j]),#, # equatorial ejecta #
                                         tau_shells[:,j], # polar ejecta
                                         escape_probs[:,j],
                                         escape_probs[:,j],
@@ -559,7 +596,7 @@ if __name__ == "__main__":
 
             lte_transition_objects = [
                             LineTransition(
-                                (line_wavelength),
+                                (line_wavelength).to("cm").value,
                                 tau_lte[:,j], # equatorial ejecta np.zeros_like(tau_shells[:,j]),#
                                 tau_lte[:,j], # polar ejecta
                                 escape_prob_lte[:,j],
@@ -573,27 +610,27 @@ if __name__ == "__main__":
                     for j, line_wavelength in enumerate(resonance_wavelengths[0])
                             if line_wavelength.to('nm').value < 2_000
             ]
-            if True:
+            if i <= 2:
                 # plot the observed spectrum
                 nan_mask = ~np.isnan(spec_ep[:, 1])
-                if epoch > 1.12:
+                if epoch > 1.17:
                     ax.step(spec_ep[nan_mask,0], scale[i]*spec_ep[nan_mask,2]+ offsets[i], ls='-', color='darkgray', alpha=0.4, lw=0.75) #/fitted_cont.eval(wavelength_grid=spec_ep[:,0]) - i 
                 ax.step(spec_ep[nan_mask,0], scale[i]*spec_ep[nan_mask,1]+ offsets[i], ls='-', color=colors[i], lw=0.75,
                                 alpha=0.8, label=f'$t={epoch}$ days')
                 
-                observer_angle = -np.pi/12 #+ np.pi/2 + np.pi/2 + np.pi/2 + np.pi/2
-                # and then compute and plot synthetic spectrum
-                photosphere = Photosphere(v_phot=(v_phots[i] * c),#.cgs.value, 
-                                        v_max=(v_outs[i] * c),#.cgs.value,
-                                        t_d=(epoch * u.day),#.cgs.value,
+                observer_angle = 0. #np.pi/4#np.pi/3#np.deg2rad(22)#np.pi/12
+                # and then compute and plot syntheti c spectrum
+                photosphere = Photosphere(v_phot=(v_phots[i] * c).cgs.value, 
+                                        v_max=(v_outs[i] * c).cgs.value,
+                                        t_d=(epoch * u.day).cgs.value,
                                         continuum=continuum,
                                         line_list=line_transition_objects,
                                         polar_opening_angle=np.pi/4,
                                         observer_angle=observer_angle)
                 
-                lte_photosphere = Photosphere(v_phot=(v_phots[i] * c),#.cgs.value, 
-                                        v_max=(v_outs[i] * c),#.cgs.value,
-                                        t_d=(epoch * u.day),#.cgs.value,
+                lte_photosphere = Photosphere(v_phot=(v_phots[i] * c).cgs.value, 
+                                        v_max=(v_outs[i] * c).cgs.value,
+                                        t_d=(epoch * u.day).cgs.value,
                                         continuum=continuum,
                                         line_list=lte_transition_objects,
                                         polar_opening_angle=np.pi/4,
@@ -602,6 +639,7 @@ if __name__ == "__main__":
                 full_wav_grid, spectrum_flux = photosphere.calc_spectrum()
                 #full_wav_grid, lte_spectrum_flux = lte_photosphere.calc_spectrum()
                 #exit()
+                spectrum_flux *= flux_scale_amplitude
                 ax.plot(full_wav_grid, scale[i]*spectrum_flux + offsets[i],# marker='.',
                                     ls='-.', ms=1, c=aayush_colors[i], lw=1)
                 # ,label=f"more physical model t={epoch}"
@@ -623,7 +661,7 @@ if __name__ == "__main__":
                 #                    fc='#ebc3d4', alpha=0.5) #ebc3d4
                 # place text stating X(Sr) at an appropriate height
                 desired_text_loc = 3_900 # i know, weird choice of number
-                if epoch == 1.12:
+                if epoch == 1.17:
                     desired_text_loc = 6200
                 valid_flux = ~np.isnan(spec_ep[:, 1])  # Mask for valid flux values
                 valid_indices = np.where(valid_flux)[0]  # Indices of valid flux
@@ -631,43 +669,72 @@ if __name__ == "__main__":
                 loc_flux = spec_ep[closest_index, 1]
 
                 ax.text(x=desired_text_loc, y=offsets[i] + loc_flux -0.1E-16, ha='left',
-                            s='$X_{Sr}=' + f'{mass_fractions[i]*100:.3f} \%$', c=colors[i])
+                            s='$X_{Sr}=' + f'{mass_fractions[i]*100:.3f} \%$', c=colors[i])#s=f"$t={epoch}$ days", c=colors[i])#
                 ax.plot(wavelength_grid, scale[i]*fitted_cont.eval(wavelength_grid=wavelength_grid) + offsets[i],
                             ls='-', color='dimgray', #label=f"{T:.2f} $\pm$ {T_sigma:.2f}",
                             lw=0.5,)
                 
                 # overplot Swift-UVOT photometry
-                if epoch == 1.12:
-                    wav = [2243.15, 2593.87, 3464.83]
-                    y_flux = np.array([5.3e-17, 2.67e-16, 3.51e-16])
-                    y_max = [7.64e-17, 3.18e-16, 4.03e-16]
-                    y_err = np.array(y_max) - np.array(y_flux)
-                    x_range = abs(np.array([1977, 2223, 3041]) - np.array(wav)) 
-                    ax.errorbar(wav, y_flux + offsets[i], yerr=y_err, xerr=x_range, marker='o',
+                if epoch == 1.17:
+                    swift_uvot_phot = np.array([[3431.4303172067657, 3.7387663382677025e-16, 5.4229879381201765e-17, 388.6973735941286],
+                    [2574.8106276298963, 2.5913688689382614e-16, 4.9462102531106275e-17, 343.14303172067656],
+                    [2224.2402575602873, 5.425938405527584e-17, 2.5380952908126773e-17, 246.58763318455547]])
+                    #wav = [2243.15, 2593.87, 3464.83]
+                    #y_flux = np.array([5.3e-17, 2.67e-16, 3.51e-16])
+                    #y_max = [7.64e-17, 3.18e-16, 4.03e-16]
+                    #y_err = np.array(y_max) - np.array(y_flux)
+                    #x_range = abs(np.array([1977, 2223, 3041]) - np.array(wav)) 
+                    ax.errorbar(swift_uvot_phot[:,0], scale[i]*swift_uvot_phot[:,1] + offsets[i], yerr=scale[i]*swift_uvot_phot[:,2], xerr=swift_uvot_phot[:,3], marker='o',
                                             c='mediumpurple', ls='', ms=3, capsize=2, alpha=0.7)
                 
-                #ax.set_ylim(top=5.5E-16, bottom=-1E-16)
+                #ax.set_ylim(top=3.8E-16, bottom=-1.9E-16)
+                #ax.set_xlim()
+                #ax.set_xscale('log')
+                #from matplotlib.ticker import ScalarFormatter
+                #ax.set_xticks([4000, 6000, 10000, 14000, 20000])
+                #ax.set_yticks([])
+                #plt.gca().yaxis.set_major_formatter(ScalarFormatter()) 
+                #plt.gca().xaxis.set_major_formatter(ScalarFormatter()) 
 
-                #plt.savefig(f'fitted_cpygni_{observer_angle:.1f}.png', dpi=300)
+                #ax.ticklabel_format(axis='x', style='plain')
+                plt.savefig(f'fitted_cpygni_{observer_angle:.1f}.png', dpi=300)
                 #photosphere.visualize_polar_region()
                 # TODO: 
                 #display_time_solution(t, level_occupancy, tau_all_timesteps, environment)
-        #break
+        if k == 0:
+            pass
+            # draw an inset zooming into the spectra.
+            '''(left, right, bottom, top) = (6100, 13100, 0.3e-16, 7e-16)
+            ax2 = ax.inset_axes([0.5, 0.5, 0.5, 0.5],
+                                 xlim=(left, right),
+                                   ylim=(bottom, top),
+                                     xticklabels=[],
+                                     yticklabels=[])
+            ax2.grid('off')
+            ax2.plot(salt_spec[:,0], scale[0]*salt_spec[:,1] + offsets[0], c='mediumpurple')
+            ep1_spec = xshooter_data(1.43)
+            ax2.plot(ep1_spec[:,0], scale[1]*ep1_spec[:,1] + offsets[1], c=colors[1])
+            left, bottom, width, height = (0.6, 0.6, 0.3, 0.3)
+            x2 = fig.add_axes([left, bottom, width, height])
+            
+            ax2.set_xticks([])
+            ax2.set_yticks([])'''
+            ax.legend(loc='upper right', title='Time since explosion')
     ax.set_ylabel('Flux [erg s$^{-1}$ cm$^{-2}$ $\mathrm{\AA}^{-1}$]')
     ax.set_xlabel("Wavelength [$\mathrm{\AA}$]")
     #ax.set_xscale('log')
     #ax.set_yticks([])
     #ax.set_xlim(left=2400, right=24000)
-    #ax.set_ylim(top=7.5E-16)
-    ax.legend(loc='upper right', title='Time since explosion')
+    #ax.set_ylim(top=8.5E-16)
+    
     #ax.set_xscale('log')
     plt.tight_layout()
-    plt.savefig(f'fitted_cpygni.png', dpi=300)
+    #plt.savefig(f'fitted_pcygni.png', dpi=300)
     
-    display_spectrum_residuals(v_shells, ne_profiles, spectrum_residuals, param_names)
+    #display_spectrum_residuals(v_shells, ne_profiles, spectrum_residuals, param_names)
     """
     _fig, _ax = plt.subplots()
-    _ax.plot([1.12, 1.43, 2.42, 3.41, 4.40], np.array(tau_phots_epochs),
+    _ax.plot([1.17, 1.43, 2.42, 3.41, 4.40], np.array(tau_phots_epochs),
              label=[f"{wav.to('nm').value:.1f}" for wav in resonance_wavelengths[0]])
     _ax.legend()
     _ax.set_yscale('log')

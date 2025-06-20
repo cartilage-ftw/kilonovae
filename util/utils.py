@@ -12,28 +12,6 @@ from lmfit import Model
 WIENS_CONSTANT = 2898 * u.Unit('um K')
 wiens_law_temperature = lambda wavelength: (WIENS_CONSTANT/wavelength).to('K')
 
-@custom_model
-def BlackBodyFlux(wavelength: u.Quantity,
-           amplitude: float = 1.,
-           temperature: float = 5000):
-    """
-    F_lambda(Å) = amplitude * π * B_lambda(T),
-    returned as plain (unitless) array in erg/(s cm^2 Å),
-    i.e. amplitude [~R^2/D^2], temperature in K.
-    """
-    wl = wavelength * u.AA#wavelength.to(u.cm)
-    T  = temperature * u.K
-
-    # Planck’s law [erg/(s cm2 cm sr)]
-    B = (2*h*c**2 / wl**5) / (np.exp(h*c/(wl*k_B*T)) - 1)
-    # convert cm→Å and strip sr:
-    B = B.to(u.erg / (u.s * u.cm**2 * u.AA * u.sr),
-             equivalencies=u.spectral_density(wl))
-    # integrate over disk → multiply by π → now F_lambda
-    F = (np.pi * B).to(u.erg / (u.s * u.cm**2 * u.AA),
-                       equivalencies=u.spectral_density(wl))
-
-    return (amplitude * F)#.value
 
 def planck_function(wavelength_grid, T, amplitude, z=0.):
     """
@@ -90,27 +68,49 @@ def fit_blackbody(wavelength, flux, masked_regions, z=0., requested_T=None):
                                                 method='differential_evolution')
 
 
+def calc_luminosity_distance(amplitude: float, v_phot: u.Quantity, t_d: u.Quantity):
+    """
+    Takes the fit from `fit_blackbody()` and given a time since explosion,
+    calculates the 
+    """
+    R_ph = v_phot * t_d
+    D_L = R_ph/np.sqrt(amplitude * 1e-20)
+    return D_L.to("Mpc")
+
 scientific_notation = lambda num: r"{:.2f} \times 10^{}".format(num / 10**int(np.log10(num)), int(np.log10(num)))
 
-def display_rate_timescale(rate_matrix, all_state_names, process_name, environment):
-    t_matrix = np.where(rate_matrix==0., np.nan, rate_matrix)#np.reciprocal(rate_matrix)
+def display_rate_timescale(rate_matrix, states, process_name, environment, mode='collapse_srI'):
+    all_state_names = states.all_names
+    if mode == 'collapse_srII':
+        num_ion_states = len(states.all_names) - len(states.names) + 1
+        t_matrix = np.zeros((num_ion_states, num_ion_states))
+        recip_mat = np.reciprocal(rate_matrix)
+        k_ = len(states.names)
+        for (i,j) in np.ndindex(rate_matrix.shape):
+            if i >= k_ and j >= k_:
+                t_matrix[i-k_,j-k_] = recip_mat[i,j]
+        fig, ax = plt.subplots(figsize=(6,6))
+        mat = ax.matshow(t_matrix, cmap='plasma_r')
+        plt.show()
+    else: 
+        t_matrix = np.where(rate_matrix==0., np.nan, rate_matrix)#np.reciprocal(rate_matrix)
+        print(np.reciprocal(rate_matrix).tolist())
+        fig, ax = plt.subplots(figsize=(6,6))
+        mat = ax.matshow(t_matrix, cmap='plasma_r')
+        ax.set_xticks(np.arange(t_matrix.shape[0]), all_state_names, rotation='vertical')
+        ax.set_yticks(np.arange(t_matrix.shape[0]), all_state_names)
 
-    fig, ax = plt.subplots(figsize=(6,6))
-    mat = ax.matshow(t_matrix, cmap='plasma_r')
-    ax.set_xticks(np.arange(t_matrix.shape[0]), all_state_names, rotation='vertical')
-    ax.set_yticks(np.arange(t_matrix.shape[0]), all_state_names)
+        ax.set_xticks(np.arange(-0.5, t_matrix.shape[0], 1), minor=True)
+        ax.set_yticks(np.arange(-0.5, t_matrix.shape[0], 1), minor=True)
+        ax.grid(which='minor', color='k', linestyle='-', linewidth=0.5)
 
-    ax.set_xticks(np.arange(-0.5, t_matrix.shape[0], 1), minor=True)
-    ax.set_yticks(np.arange(-0.5, t_matrix.shape[0], 1), minor=True)
-    ax.grid(which='minor', color='k', linestyle='-', linewidth=0.5)
+        ax.set_xlabel(f"$t_d={environment.t_d}$ days, $n_e={scientific_notation(environment.n_e)}$" +" cm$^{-3}$")
+        plt.colorbar(mat, ax=ax, label=r'$\tau$ [s]')
+        plt.title(f"{process_name} Rate")
 
-    ax.set_xlabel(f"$t_d={environment.t_d}$ days, $n_e={scientific_notation(environment.n_e)}$" +" cm$^{-3}$")
-    plt.colorbar(mat, ax=ax, label=r'$\tau$ [s]')
-    plt.title(f"{process_name} Rate")
+        plt.tight_layout()
 
-    plt.tight_layout()
-
-    plt.savefig(f"t_{process_name.lower()}.png")
+        plt.savefig(f"t_{process_name.lower()}.png")
     #plt.show()
 
 telluric_cutouts = np.array([

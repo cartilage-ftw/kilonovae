@@ -60,7 +60,7 @@ def source_function(v, g_u, g_l, n_u_grid, n_l_grid, v_grid, nu_0):
     return (2 * h * nu_0**3 / c**2) / (g_u * n_l / (g_l * n_u) - 1)
 
 @jax.jit
-def S(p, z, r, r_min, r_max, v, sob_esc_prob, g_u, g_l, n_u_grid, n_l_grid, v_grid, nu_0, continuum, mode='classic'):
+def S(p, z, r, r_min, r_max, v, sob_esc_prob, g_u, g_l, n_u_grid, n_l_grid, v_grid, nu_0, continuum, mode='level-pop'):
 
     outside_photosphere = (r < r_min) | (r > r_max)
     occulted_region = (z < 0) & (p < r_min)
@@ -68,7 +68,7 @@ def S(p, z, r, r_min, r_max, v, sob_esc_prob, g_u, g_l, n_u_grid, n_l_grid, v_gr
         # the level populations are given from the NLTE calculation
         return jnp.where(outside_photosphere | occulted_region,
                         1e-10,
-                        sob_esc_prob*source_function(v, g_u, g_l, n_u_grid, n_l_grid, v_grid, nu_0)/(4*np.pi)
+                        sob_esc_prob*source_function(v, g_u, g_l, n_u_grid, n_l_grid, v_grid, nu_0)
                         )
     else:
         return jnp.where(outside_photosphere | occulted_region,
@@ -204,7 +204,9 @@ class Photosphere:
 
         inside_polar = self.is_polar(X, Y, Z, R)#is_polar_ejecta(P, Z, self.polar_opening_angle, self.observer_angle)
         inside_polar &= (R) <= self.v_max/c
-
+        print("Polar‐cone fraction:",
+                    inside_polar.mean(),  # fraction of pixels in the
+                    "→ solid‐angle fraction ≈", 1 - np.cos(self.polar_opening_angle/2))
         pos = ax.imshow(inside_polar, extent=(-self.v_max/c, self.v_max/c, -self.v_max/c, self.v_max/c), 
                         cmap='coolwarm_r', origin='lower')
         fig.colorbar(pos, ax=ax,label='Polar Ejecta')
@@ -221,6 +223,7 @@ class Photosphere:
         ax.set_ylabel("p (c)")
         plt.tight_layout()
         ax.set_aspect('equal')
+        plt.savefig(f"polar_ejecta_{self.observer_angle:.2f}.png", dpi=300)
         plt.show()
 
     @jax.jit
@@ -251,9 +254,9 @@ class Photosphere:
         x_rot = x * jnp.cos(beta) + z*jnp.sin(beta)
         y_rot = y
         z_rot = -x * jnp.sin(beta) + z * jnp.cos(beta)
-        inside_polar = jnp.abs(z_rot / r) >= jnp.cos(self.polar_opening_angle/2)
+        inside_polar = jnp.abs(jnp.arcsin(jnp.sqrt(x_rot**2 + y_rot**2)/r)) <= self.polar_opening_angle/2
+                        #jnp.abs(z_rot / r) >= jnp.cos(self.polar_opening_angle/2)
         return inside_polar
-
 
     @jax.jit
     def I_emit(self, p: float, phi: float, delta_arr: jnp.array, continuum: float):
@@ -262,7 +265,7 @@ class Photosphere:
         v_arr = r_arr/self.t_d
 
         # project to sky-plane coordinates
-        x = p * jnp.cos(phi)
+        x = p * jnp.cos(phi) 
         y = p * jnp.sin(phi)
         # check if it falls within the "polar" cones or not
         inside_polar = self.is_polar(x, y, z_arr, r_arr)
@@ -273,6 +276,7 @@ class Photosphere:
         # and that's just 'z' in the impact geometry.
         order = jnp.argsort(z_arr)[::-1]
         # a helper function, because the S function is a bit long
+        # TODO: the sobolev escape probability is to be be allowed to be different in the poles and the equator
         S_i = lambda line, p, z, r, v: S(p, z, r, self.r_min, self.r_max, v, line.sob_esc_prob_eq(v/c), line.g_upper, line.g_lower, line.n_upper, line.n_lower, line.velocity_grid, line.nu_0, continuum)  
         
         tau_i = jnp.zeros_like(z_arr)
@@ -357,7 +361,7 @@ class Photosphere:
         #plt.show()
         return ~mask
 
-    def calc_spectrum(self, start_wav=2_350*u.AA, end_wav=24_500*u.AA, n_points=2000):
+    def calc_spectrum(self, start_wav=2_350*u.AA, end_wav=24_500*u.AA, n_points=200):
         """
         I was thinking, if I pass v_phot and v_max here that can be used for a fitting routine
         it can be used to update v_phot and v_max set in the Photosphere object
@@ -376,15 +380,12 @@ class Photosphere:
         nu_grid = np.linspace(nu_min, nu_max, n_points)
         lamb_grid = (c/nu_grid) * u.cm
         Fnu_list = []
-        # pre-compute the continuum flux (Planck function)
-        B_lambda_grid = self.continuum(lamb_grid)#.cgs#.value
 
-        B_nu_grid = convert_flux(lamb_grid, B_lambda_grid, out_flux_unit='erg / (Hz s cm2 sr)')#.cgs#.value
-        # I will have to convert to cgs units for consistency and then strip the units before calculating spectrum
+        # pre-compute the continuum flux (passed as a BlackBody object)
+        B_nu_grid = self.continuum(nu_grid * u.Hz)
+
+        # I will have to convert to cgs units for consistency and then strip the units before calculating spectrum 
         Bnu_cgs_unit = B_nu_grid.unit
-        #print("Units of B_nu", B_nu_grid.unit)
-        #print("Unit of B_\lambda", B_lambda_grid.unit)
-        #exit()
         B_nu_grid = B_nu_grid.value
 
         # In a lot of the spectrum, there may not be any opacity to cause absorption/emission
@@ -392,17 +393,13 @@ class Photosphere:
         line_masks = self.get_line_mask(nu_grid)
 
         p_grid = np.linspace(0, self.r_max, 200)
-        flat_continuum_grid = np.ones_like(B_nu_grid)
         #print("Starting flux integration!")
         t_i = time.time()
-        Fnu_list = self.calc_spectral_flux(nu_grid, line_masks, flat_continuum_grid, p_grid)
+        Fnu_list = self.calc_spectral_flux(nu_grid, line_masks, B_nu_grid, p_grid)
 
-        
         #t_i = time.time()
-        #print("Devices: ", jax.devices(), "count: ", jax.device_count())
-        #print("Preparing F_lambda")
-        Fnu_list = np.array(Fnu_list) * B_nu_grid
-        F_lambda = convert_flux(nu_grid * u.Hz, Fnu_list * Bnu_cgs_unit * u.sr, out_flux_unit='1e20 erg / (s AA cm2)')
+        Fnu_list = np.array(Fnu_list)
+        F_lambda = convert_flux(nu_grid * u.Hz, Fnu_list * Bnu_cgs_unit * u.sr, out_flux_unit='erg /(s AA cm2)')
         wavelength_grid = (lamb_grid).to("AA").value
         print(f"Time taken: {(time.time() - t_i):.3f} seconds for full spectrum calculation")
         #print("Took", t_i - time.time(), "to prepare F_lambda")
