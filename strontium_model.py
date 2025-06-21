@@ -41,7 +41,7 @@ MAX_ENERGY_LEVEL = 25_000.0 # cm-1, corresponds to 400 nm from ground state.
 ionization_stages_names = ['Sr I', 'Sr III', 'Sr IV', 'Sr V']
 
 # strontium mass fraction (not just Sr II, all stages)
-mass_fraction = 0.0002 # for initialization, will be fitted later
+#mass_fraction = 0.0002 # for initialization, will be fitted later
 
 spectra_root= './Spectral Series of AT2017gfo/'
 xshooter_dir = spectra_root + '1.43-9.4 - X-shooter/dereddened+deredshifted_spectra/'
@@ -180,8 +180,8 @@ def blackbody_with_pcygnis(wavelength_grid, taus, line_wavelengths, planck_conti
     # i wanted to visualize what it was doing
     if display == True:
         fig2, ax2 = plt.subplots()
-        for i, profile in enumerate(pcygni_profiles):
-            ax2.plot(wavelength_grid, profile, label=f'{line_wavelengths[i].value:.2f}' + r'$\mathrm{\AA}$')
+        for ii, profile in enumerate(pcygni_profiles):
+            ax2.plot(wavelength_grid, profile, label=f'{line_wavelengths[ii].value:.2f}' + r'$\mathrm{\AA}$')
         ax2.plot(wavelength_grid, product_profiles, c='k', label='ALL!')
         handles, labels = ax2.get_legend_handles_labels()
         plt.text(x=18000, y=0.9*np.max(product_profiles), s=f"$t={t_0.to('day')}$ days")
@@ -286,8 +286,8 @@ def display_best_fit_density_profiles(v_grid, ne_profiles, residuals, density_pa
 
     colors = mpl.colormaps['Spectral'](np.linspace(0., 1., len(density_param_names)))
     best = np.argmin(residuals)
-    for i, profile in enumerate(ne_profiles):
-        _ax.plot(v_grid, profile, alpha=alphas[i], c='mediumpurple', label=density_param_names[i])
+    for ii, profile in enumerate(ne_profiles):
+        _ax.plot(v_grid, profile, alpha=alphas[ii], c='mediumpurple', label=density_param_names[ii])
     _ax.set_yscale("log")
     _ax.legend(ncols=1)
     _ax.set_title("Best: " + str(density_param_names[best]))
@@ -349,13 +349,13 @@ if __name__ == "__main__":
     v_refs = [0.2] * 5
     mass_fractions = 0.015 * np.ones_like(v_phots)#[0.003, 0.0001, 0.0025, 0.1, 0.2]#[0.00045, 0.03, 0.15, 0.4]#[0.00055, 0.0015, 0.0075, 0.007]#[0.00008, 0.00004, 0.00015, 0.0002]
 
-        #misc.plot_ionization_temporal(np.array([4400, 3200, 2900, 2800]), np.array([1.43, 2.42, 3.41, 4.40]),
+    #misc.plot_ionization_temporal(np.array([4400, 3200, 2900, 2800]), np.array([1.43, 2.42, 3.41, 4.40]),
     #                       np.array(v_phots))
     #tau_wavelength = None
 
-    def _compute_tau_shell_sr(v_line, n_e, epoch, T_phot, T_electrons, mass_fraction, atomic_mass,
-                           v_phot):
-        #print("Initializing for line_velicity", v_line)
+    def _compute_tau_shell_sr(v_line, n_e, epoch, v_phot, T_phot, T_electrons, mass_fraction, atomic_mass):
+        print(f"Initializing t={epoch} for line_velocity", v_line, "T_phot", T_phot, "T_electrons", T_electrons,
+              "mass fraction", mass_fraction, "v_phot", v_phot, 'n_e', n_e)
         env = Environment(t_d=epoch, T_phot=T_phot, mass_fraction=mass_fraction,
                           atomic_mass=atomic_mass, n_e=n_e, photosphere_velocity=v_phot,
                           line_velocity=v_line, T_electrons=T_electrons)
@@ -382,8 +382,7 @@ if __name__ == "__main__":
     
 
     
-    def compute_tau_LTE(v_line, n_e, epoch, T_phot, mass_fraction, v_phot):
-        atomic_mass = 88
+    def compute_tau_LTE(v_line, n_e, epoch, T_phot, mass_fraction, v_phot, atomic_mass):
 
         env = Environment(t_d=epoch, T_phot=T_phot, mass_fraction=mass_fraction,
                           atomic_mass=atomic_mass, n_e=n_e, photosphere_velocity=v_phot,
@@ -472,25 +471,42 @@ if __name__ == "__main__":
             #exit()
             #exit()
 
-            mp.context._force_start_method('spawn')
+            #mp.context._force_start_method('spawn')
             compute_tau_shell_worker = partial(_compute_tau_shell_sr,
-                                            epoch=epoch,
-                                            T_phot=T_phots[i],
-                                                T_electrons=T_e,
+                                            #epoch=epoch,
+                                            #T_phot=T_phots[i],
+                                                #T_electrons=T_e,
                                                 atomic_mass=88,
-                                                mass_fraction=mass_fractions[i],
-                                                v_phot=v_phots[i])
-
+                                                #mass_fraction=mass_fractions[i],
+                                                #v_phot=v_phots[i]
+                                                )
+            #v_line, n_e, epoch, v_phot, T_phot, T_electrons, mass_fraction,
             _compute_LTE_tau_worker = partial(compute_tau_LTE,
-                                            epoch=epoch, T_phot=T_phots[i],
-                                            mass_fraction=mass_fraction,
-                                            v_phot=v_phots[i]
+                                              atomic_mass=88,
+                                            #epoch=epoch, T_phot=T_phots[i],
+                                            #mass_fraction=mass_fractions[i],
+                                            #v_phot=v_phots[i]
                                             )
-            with ProcessingPool(num_cores) as pool:
-                results = pool.map(lambda params: compute_tau_shell_worker(*params), zip(v_shells, ne_profile))
-                lte_results = pool.map(lambda params: _compute_LTE_tau_worker(*params), zip(v_shells, ne_profile))
 
-            # TODO: unpaack  the results here
+            with ProcessingPool(num_cores) as pool:
+                results = pool.map(lambda params: compute_tau_shell_worker(*params),
+                                     zip(v_shells,
+                                          ne_profile,
+                                          epoch * np.ones_like(v_shells),
+                                          v_phots[i] * np.ones_like(v_shells),
+                                          T_phots[i] * np.ones_like(v_shells),
+                                          T_e * np.ones_like(v_shells),
+                                          mass_fractions[i] * np.ones_like(v_shells)
+                                          ))
+        
+                lte_results = pool.map(lambda params: _compute_LTE_tau_worker(*params),
+                                     zip(v_shells,
+                                         ne_profile,
+                                         epoch * np.ones_like(v_shells),
+                                         T_phots[i] * np.ones_like(v_shells),
+                                         mass_fractions[i] * np.ones_like(v_shells),
+                                         v_phots[i] * np.ones_like(v_shells),
+                                         ))
 
             print("COUNTING!: ", i, epoch, T_e)
             # 'plum', 'orchid', 'mediumpurple', 'mediumslateblue',
@@ -498,7 +514,7 @@ if __name__ == "__main__":
             
             mark_offsets = [-0.9E-16, 0., -2.5E-17, -0.7E-16, -0.9E-16]
             # mark the Sr II triplets
-            if False: 
+            if True: 
                 ax.vlines(triplets * (1-v_phots[i]), 2e-16 + offsets[i] + mark_offsets[i],
                                      3e-16 + offsets[i] + mark_offsets[i],lw=1,
                             ls='--',ec=colors[i], alpha=0.6)
@@ -533,7 +549,6 @@ if __name__ == "__main__":
             print("Calculated luminosity distance:",
                    utils.calc_luminosity_distance(amplitude/np.pi, v_phots[i] * c, epoch * u.day))
             print(rf"Fitted blackbody temperature: {T:.1f} K")
-            
             flux_scale_amplitude = amplitude * 1e-20
             # this continuum object will be passed to the line formation code.
             continuum = BlackBody(temperature = T * u.K, scale=1*u.Unit("erg/(s cm2 Hz sr)"))
@@ -551,7 +566,7 @@ if __name__ == "__main__":
             if False:
                 misc.plot_tau_shells(tau_shells, tau_wavelength)
                 misc.plot_mean_ionization(v_shells, shell_occupancies, epoch)
-            print("At t=",epoch)
+            print("At t=",epoch, "T_phot", T_phots[i], "T_electrons", T_e, "mass_fraction", mass_fractions[i])
             #misc.print_luminosities(SrII_states, line_luminosities, tau_shells)
             #misc.print_line_things(SrII_states, v_shells, shell_occupancies, tau_shells)
             
@@ -580,6 +595,7 @@ if __name__ == "__main__":
             for j, line_wavelength in enumerate(resonance_wavelengths[0]):
                 # ignore forbidden lines that are too weak and will not be visible
                 if line_wavelength.to("nm").value > 2_000: continue
+                #print("Escape probability for", line_wavelength.to("nm").value, "is", escape_probs[:,j])
                 line_transition = LineTransition(
                                         (line_wavelength).to("cm").value,
                                         tau_shells[:,j],#np.zeros_like(tau_shells[:,j]),#, # equatorial ejecta #
@@ -610,7 +626,7 @@ if __name__ == "__main__":
                     for j, line_wavelength in enumerate(resonance_wavelengths[0])
                             if line_wavelength.to('nm').value < 2_000
             ]
-            if i <= 2:
+            if True:
                 # plot the observed spectrum
                 nan_mask = ~np.isnan(spec_ep[:, 1])
                 if epoch > 1.17:

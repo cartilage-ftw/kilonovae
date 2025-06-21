@@ -27,6 +27,8 @@ num_cores = mp.cpu_count()
 # There isn't any point in it using GPU when there aren't enough points to calculate.
 jax.config.update('jax_platform_name', 'cpu')
 jax.config.update('jax_num_cpu_devices', num_cores)
+# to use 64 bit floats?
+#jax.config.update('jax_enable_x64', True)
 #print("Number of CPU cores available", jax.device_count())
 
 # I don't like cgs units, but we're doing astronomy so I have to live with it
@@ -50,17 +52,20 @@ def W(r, r_min):
     return (1 - jnp.sqrt(1 - (r_min/r)**2)) / 2
 
 @jax.jit
-def source_function(v, g_u, g_l, n_u_grid, n_l_grid, v_grid, nu_0):
+def source_function(nu, v, g_u, g_l, n_u_grid, n_l_grid, v_grid, nu_0, continuum, photosphere, mode='nLTE'):
     """
     The source function, defined as the ratio of the emissivity to the absorption coefficient
     has the following form.
     """
+    if mode == 'LTE':
+        #T = photosphere.continuum.temperature.value
+        return continuum#(2 * h * nu_0**3 / c**2) / (jnp.exp(h * nu_0 / (k_B * T)) - 1)
     n_u = jnp.interp(v / c, v_grid, n_u_grid)
     n_l = jnp.interp(v / c, v_grid, n_l_grid)
     return (2 * h * nu_0**3 / c**2) / (g_u * n_l / (g_l * n_u) - 1)
 
 @jax.jit
-def S(p, z, r, r_min, r_max, v, sob_esc_prob, g_u, g_l, n_u_grid, n_l_grid, v_grid, nu_0, continuum, mode='level-pop'):
+def S(nu, p, z, r, r_min, r_max, v, sob_esc_prob, g_u, g_l, n_u_grid, n_l_grid, v_grid, nu_0, continuum, photosphere, mode='level-pop'):
 
     outside_photosphere = (r < r_min) | (r > r_max)
     occulted_region = (z < 0) & (p < r_min)
@@ -68,7 +73,7 @@ def S(p, z, r, r_min, r_max, v, sob_esc_prob, g_u, g_l, n_u_grid, n_l_grid, v_gr
         # the level populations are given from the NLTE calculation
         return jnp.where(outside_photosphere | occulted_region,
                         1e-10,
-                        sob_esc_prob*source_function(v, g_u, g_l, n_u_grid, n_l_grid, v_grid, nu_0)
+                        sob_esc_prob*source_function(nu, v, g_u, g_l, n_u_grid, n_l_grid, v_grid, nu_0, continuum, photosphere)#/np.pi
                         )
     else:
         return jnp.where(outside_photosphere | occulted_region,
@@ -259,7 +264,7 @@ class Photosphere:
         return inside_polar
 
     @jax.jit
-    def I_emit(self, p: float, phi: float, delta_arr: jnp.array, continuum: float):
+    def I_emit(self, nu: float, p: float, phi: float, delta_arr: jnp.array, continuum: float):
         z_arr = calc_z(p, self.t_d, delta_arr)
         r_arr  = calc_r(p, z_arr)
         v_arr = r_arr/self.t_d
@@ -277,7 +282,7 @@ class Photosphere:
         order = jnp.argsort(z_arr)[::-1]
         # a helper function, because the S function is a bit long
         # TODO: the sobolev escape probability is to be be allowed to be different in the poles and the equator
-        S_i = lambda line, p, z, r, v: S(p, z, r, self.r_min, self.r_max, v, line.sob_esc_prob_eq(v/c), line.g_upper, line.g_lower, line.n_upper, line.n_lower, line.velocity_grid, line.nu_0, continuum)  
+        S_i = lambda line, p, z, r, v: S(nu, p, z, r, self.r_min, self.r_max, v, line.sob_esc_prob_eq(v/c), line.g_upper, line.g_lower, line.n_upper, line.n_lower, line.velocity_grid, line.nu_0, continuum, self)  
         
         tau_i = jnp.zeros_like(z_arr)
         _Si = jnp.zeros_like(z_arr)
@@ -303,14 +308,14 @@ class Photosphere:
             return 2*np.pi* jnp.trapezoid(I_vals, p_grid)
         return jnp.where(line_mask, F_continuum, line_flux())'''
     @jax.jit
-    def calc_flux_at_nu(self,nu: float, delta_arr: jnp.ndarray, line_mask: bool, p_grid: jnp.ndarray, B_nu: float):
+    def calc_flux_at_nu(self, nu: float, delta_arr: jnp.ndarray, line_mask: bool, p_grid: jnp.ndarray, B_nu: float):
         # immediate continuum case (because there are no lines to calculate)
         F_cont = jnp.pi * self.r_min**2 * B_nu
         def line_flux():
             Nphi = 200
             phi = jnp.linspace(0.0, 2*jnp.pi, Nphi, endpoint=False)
             I_p_phi = jax.vmap(lambda p: jax.vmap(
-                                    lambda phi: self.I_emit(p, phi, delta_arr, B_nu)
+                                    lambda phi: self.I_emit(nu, p, phi, delta_arr, B_nu)
                                 )(phi), in_axes=(0,)
                             )(p_grid)
             J_p = jnp.trapezoid(I_p_phi, phi, axis=1)
