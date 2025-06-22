@@ -14,7 +14,7 @@ import astropy.constants as const
 def get_effective_strength_mulholland(states, T_e):
     path = './atomic_data/Mulholland_supplemental_files/srii_lpm_qub.adf04'
     # table has a convenient two-digit (j,i) index
-    dat = pd.read_csv(path, sep='\s+', skiprows=27, skipfooter=28, index_col=[0,1])
+    dat = pd.read_csv(path, sep='\s+', skiprows=27, skipfooter=28, index_col=[0,1], engine='python')
     # skip the first row with A-value and last row with infinite temperature estimates;
     # that goes beyond our needs anyways
     temp_cols = dat.columns[1:-1] # keep this var for easy access later
@@ -52,20 +52,17 @@ def get_effective_strength_mulholland(states, T_e):
                 # i, j are indices in the M24 table and NOT the order of loaded NIST levels
                 i = get_m24_idx(init) + 1
                 j = get_m24_idx(final) + 1
-                print(f'{ii}, {jj}')
+                #print(f'{ii}, {jj}')
                 if jj > ii:
                     print(f'Filling value for {ii}, {jj} [{init}->{final}]; {j}->{i}')
-                    print(f'Found {upsilon_ij(i,j)} for (j,i) -> ({j},{i})')
+                    #print(f'Found {upsilon_ij(i,j)} for (j,i) -> ({j},{i})')
                     del_E = E(final) - E(init) # should already be in eV
                     coeff_matrix[jj, ii] = 8.63E-6/(g(init)*T**0.5).value \
                                     * upsilon_ij(i, j) \
                                     * np.exp(-del_E/(const.k_B * T))
                     coeff_matrix[ii, jj] = g(init)/g(final) \
                                      * np.exp(del_E/(const.k_B * T)) \
-                                     * coeff_matrix[ii, jj]
-        print("---!!!!!----")
-        print("COLLISION COEFF MATRIX:\n", coeff_matrix)
-        print("----!!!!_-----")
+                                     * coeff_matrix[jj, ii]
         return coeff_matrix
     return fill_coeff_matrix()
 
@@ -76,7 +73,6 @@ def get_effective_strength_mulholland(states, T_e):
 @lru_cache
 def read_effective_collision_strengths_table():
     data = pd.read_csv("atomic data/Transition_rates.csv", delimiter=";")
-
 
     # The data is formatted wierdly, and we need to transform columns as such:
     # The first column "Transition" has some rows like "XXX-YYY" followed by lines with only "YYY" (ie implying XXX-YYY)
