@@ -4,6 +4,7 @@ import pandas
 import astropy.units as u
 import astropy.constants as consts
 from astropy.modeling.physical_models import BlackBody
+from astropy.modeling.powerlaws import SmoothlyBrokenPowerLaw1D
 from dataclasses import dataclass, field
 from scipy.integrate import quad, solve_ivp
 from functools import lru_cache, partial
@@ -109,6 +110,24 @@ def get_density_profile(M_ej, atomic_mass, mass_fraction):
     number_density_0 = (rho_0 * mass_fraction / atomic_mass).cgs.value
     return lambda v, t: rho(v, t, number_density_0)
 
+@dataclass
+class BrokenPowerLawProfile:
+    exponents: list[float]
+    v_break_position: float = 0.2 #position of the break, in units of 'c'
+    amplitude: float = 1e7
+    delta: float = 0.01
+    profile: SmoothlyBrokenPowerLaw1D = None
+
+    def __post_init__(self):
+        self.profile = SmoothlyBrokenPowerLaw1D(amplitude=self.amplitude,
+                                 x_break = self.v_break_position,
+                                 alpha_1 = self.exponents[0],
+                                 alpha_2 = self.exponents[1],
+                                 delta = self.delta)
+        
+    def __call__(self, v):
+        return self.profile(v)
+
 # Environment class, contains all the parameters of the environment at a given time and radius, the inputs to the NLTE calculation
 # The following parameters are calculated from the input parameters:
 #   - Doppler shifted temperature
@@ -129,7 +148,7 @@ class Environment:
     # calculated values (Will be calculated from the input values)
     spectrum : BlackBody = None # Experienced spectrum at the ROI. Contains the doppler shifted temperature
     T_electrons: float = None # K temperature of the electrons (doppler shifted photosphere temperature)
-    n_e: float = 1.5e8 # count/cm^3	
+    n_e: float = None # count/cm^3	
     n_He: float = None # count/cm^3
     q_dot: float = None # eV/s/ion
     # Calculate derived values based on the input values
@@ -146,24 +165,47 @@ class Environment:
             self.T_electrons = self.T_electrons#* (1 + self.line_velocity)**1.3#/(1/np.sqrt(1 - delta_v**2) * (1+delta_v))
         W = 0.5*(1-np.sqrt(1-(self.photosphere_velocity/self.line_velocity)**2)) # geometric dilution factor
         self.spectrum = BlackBody(self.T_phot * u.K, scale=W*u.Unit("erg/(s Hz sr cm2)")) 
-        self.n_e *= (self.line_velocity/0.2)**-5 * self.t_d**-3 # Extracted from the paper, see electron_model_reconstruction.ipynb
-        self.n_He = get_density_profile(self.M_ejecta, self.atomic_mass, self.mass_fraction)(self.line_velocity, self.t_d)
+        
+        self.ne_profile = self.normalize_density(BrokenPowerLawProfile(exponents=[3,10], v_break_position=0.2))
+        
+        if self.n_e == None:
+            self.n_e = self.ne_profile(self.line_velocity) * self.t_d**-3#1.5e8 * (self.line_velocity/0.2)**-5 * self.t_d**-3 # Extracted from the paper, see electron_model_reconstruction.ipynb
+        else:
+            self.n_e /= self.t_d**3 
+        
+        if self.n_He == None:
+            self.n_He = self.n_e * self.mass_fraction#get_density_profile(self.M_ejecta, self.atomic_mass, self.mass_fraction)(self.line_velocity, self.t_d)
+        else:
+            self.n_He = self.n_He / self.t_d**3
+        #    print("n_Sr=", self.n_He, f"for line velocity {self.line_velocity} mass fraction", self.mass_fraction)
+        
+
         self.q_dot = 1 * self.t_d**-1.3 # Radiative power of non-thermal electrons
 
-def get_num_density(mass_fraction, env):
-    n_He = get_density_profile(env.M_ejecta, env.atomic_mass, mass_fraction)(env.line_velocity, env.t_d)
-    if env.n_He != n_He:
-        env.n_He = n_He
-    # needed this to allow treating mass_fraction as a free parameter for fitting
-    return n_He
-    
-def estimate_tau(environment, states, y, A, mass_fraction, mode='non-LTE', srII_fraction='from-nLTE'):
+    def normalize_density(self, profile):
+        def dM__dv(v):
+            r = (v * consts.c * 1 * u.day).to("cm")#.value
+            dMdV = profile(v) * u.g / u.cm**3
+            dVdr = 4 * np.pi * r**2
+            drdv = (1 * u.day)
+            dMdv = ((dMdV) * (dVdr) * (drdv))
+            return (consts.c * dMdv).cgs.value
+        N_atoms = (self.M_ejecta * u.M_sun / (self.atomic_mass * u.u)).cgs.value
+        norm_constant = N_atoms / quad(dM__dv, 0.1, 0.5)[0]
+        #print("Normalization constant", norm_constant)
+        #print(profile(0.2), "after normalization", norm_constant *profile(0.2)/1e8)
+        return lambda v: norm_constant * profile(v)
+
+
+def estimate_tau(env, states, y, A, mass_fraction, mode='non-LTE', srII_fraction=None):
     if mode == 'non-LTE':
         assert y.T.shape[0] == len(states.all_names)
-        n = y.T[:len(states.names)] * get_num_density(mass_fraction, environment) / u.cm**3
+        n = y.T[:len(states.names)] * env.n_He / u.cm**3 #get_density_profile(env.M_ejecta, env.atomic_mass, mass_fraction)(env.line_velocity, env.t_d) \
+                                       # / u.cm**3
     else:
         # if LTE, then provide a SrII fraction from LTE ionization calc.        assert np.isfinite(srII_fraction)
-        n = y.T * srII_fraction * get_num_density(mass_fraction, environment) / u.cm**3
+        n = y.T * srII_fraction * env.n_He / u.cm**3# get_density_profile(env.M_ejecta, env.atomic_mass, mass_fraction)(env.line_velocity, env.t_d)\
+                                    
     eps0 = 1/(4 * np.pi) # i dont like gauss units
     tau = np.zeros((len(n), len(n)))
     # The sobolev depth is calculated individually for each transition
@@ -174,7 +216,7 @@ def estimate_tau(environment, states, y, A, mass_fraction, mode='non-LTE', srII_
             if dE <= 0:
                 continue
             lam = dE.to("cm", equivalencies=u.spectral())
-            tau[i,j] = lam**3*eps0 * A[i,j]* u.s**-1 * n[i]/2 * (states.multiplicities[j]/ states.multiplicities[i] - n[j]/n[i]) * (environment.t_d * u.day)
+            tau[i,j] = lam**3*eps0 * A[i,j]* u.s**-1 * n[i]/2 * (states.multiplicities[j]/ states.multiplicities[i] - n[j]/n[i]) * (env.t_d * u.day)
     # calculate optical depth and escape probability        
     tau = np.maximum(tau,tau.T)+1e-8
     #xd = lam**3*eps0 * A[i,j]* u.s**-1 * n[i]/2 * (states.multiplicities[j]/ states.multiplicities[i] - n[j]/n[i]) * (environment.t_d * u.day).to('s')
@@ -261,7 +303,7 @@ def solve_NLTE_sob(environment, states, nlte_solver, mass_fraction, relaxation_s
             line_luminosities[j,i] = line_luminosities[i,j]'''
             
     return t, occupancy_all, tau, beta #tau_all_timesteps, line_luminosities#, nlte_solver
-        
+
 
 '''print("occupancy", occupancy_all[j,-1])
             print(r"\beta*A", radiative_process.A[i,j])

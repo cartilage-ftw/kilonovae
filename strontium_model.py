@@ -27,7 +27,7 @@ import NLTE.NLTE_model
 import util.atomic_utils as atomic_utils
 import util.utils as utils
 from line_formation_jax import LineTransition, Photosphere
-from NLTE.NLTE_model import (CollisionProcess, Environment,
+from NLTE.NLTE_model import (BrokenPowerLawProfile, CollisionProcess, Environment,
                              HotElectronIonizationProcess, NLTESolver,
                              PhotoionizationProcess, RadiativeProcess,
                              RecombinationProcess, States)
@@ -280,8 +280,8 @@ def display_best_fit_density_profiles(v_grid, ne_profiles, residuals, density_pa
     """
     fig, _ax = plt.subplots()
     alphas = np.array(residuals)
-    # rescale between 0.01 and 1.
-    alphas = np.interp(alphas, (alphas.min(), alphas.max()), [0.01,1])
+    # rescale between 1e-4 and 1.
+    alphas = np.interp(alphas, (alphas.min(), alphas.max()), [1e-4, 1])
     print(alphas)
 
     colors = mpl.colormaps['Spectral'](np.linspace(0., 1., len(density_param_names)))
@@ -347,17 +347,19 @@ if __name__ == "__main__":
     #v_phots = [0.26, 0.24, 0.22, 0.18, 0.16]#[0.236, 0.19, 0.18, 0.162]#[0.2, 0.13, 0.12, 0.11]
     ve_s = [0.32] * 5 
     v_refs = [0.2] * 5
-    mass_fractions = 0.015 * np.ones_like(v_phots)#[0.003, 0.0001, 0.0025, 0.1, 0.2]#[0.00045, 0.03, 0.15, 0.4]#[0.00055, 0.0015, 0.0075, 0.007]#[0.00008, 0.00004, 0.00015, 0.0002]
+    mass_fractions = 0.004*np.ones_like(v_phots)##[0.003, 0.0001, 0.0025, 0.1, 0.2]#[0.00045, 0.03, 0.15, 0.4]#[0.00055, 0.0015, 0.0075, 0.007]#[0.00008, 0.00004, 0.00015, 0.0002]
 
     #misc.plot_ionization_temporal(np.array([4400, 3200, 2900, 2800]), np.array([1.43, 2.42, 3.41, 4.40]),
     #                       np.array(v_phots))
     #tau_wavelength = None
 
-    def _compute_tau_shell_sr(v_line, n_e, epoch, v_phot, T_phot, T_electrons, mass_fraction, atomic_mass):
-        print(f"Initializing t={epoch} for line_velocity", v_line, "T_phot", T_phot, "T_electrons", T_electrons,
-              "mass fraction", mass_fraction, "v_phot", v_phot, 'n_e', n_e)
+    def _compute_tau_shell_sr(v_line, n_e, n_Sr, epoch, v_phot, T_phot, T_electrons, mass_fraction):
+        atomic_mass=88
+        #print("epoch", epoch, "v_line", v_line, "n_e", n_e, "n_Sr", n_Sr)
+        #print(f"Initializing t={epoch} for line_velocity", v_line, "T_phot", T_phot, "T_electrons", T_electrons,
+        #      "mass fraction", mass_fraction, "v_phot", v_phot, 'n_e', n_e, 'n_Sr', n_Sr)
         env = Environment(t_d=epoch, T_phot=T_phot, mass_fraction=mass_fraction,
-                          atomic_mass=atomic_mass, n_e=n_e, photosphere_velocity=v_phot,
+                          atomic_mass=atomic_mass, n_e=n_e, n_He=n_Sr, photosphere_velocity=v_phot,
                           line_velocity=v_line, T_electrons=T_electrons)
 
         processes = [
@@ -367,10 +369,10 @@ if __name__ == "__main__":
                                 RecombinationProcess(SrII_states, env),
                                 # PhotoionizationProcess(SrII_states, env)
                             ]
-        #print(SrII_states.all_names)
-        #print("Transition rate matrix for radiative process:\n", processes[3].get_transition_rate_matrix())
-        #utils.display_rate_timescale(processes[0].get_transition_rate_matrix(), SrII_states.all_names,
-        #                             process_name = processes[0].name, environment=env)
+        #print(SrII_states.tex_names)
+        #print("Transition rate matrix for collision process:\n", processes[1].get_transition_rate_matrix())
+        #utils.display_rate_timescale(processes[1].get_transition_rate_matrix(), SrII_states,
+        #                             process_name = processes[1].name, environment=env)
 
         solver = NLTESolver(env, SrII_states, processes=processes)
         t_arr, pops, tau_mat, beta_mat = NLTE.NLTE_model.solve_NLTE_sob(env, SrII_states, solver, mass_fraction)
@@ -415,12 +417,22 @@ if __name__ == "__main__":
 
     v_shells = np.linspace(0.1, 0.5, 100)
 
-    broken_p_law = lambda a1, a2, amplitude=1e7, v_break=0.2, delta=0.01: SmoothlyBrokenPowerLaw1D(amplitude=amplitude,
+    dummy_env = Environment()
+    broken_p_law = lambda a1, a2, amplitude=1e7, v_break=0.2, delta=0.01: \
+                                dummy_env.normalize_density(
+                                    BrokenPowerLawProfile(
+                                        exponents=[a1, a2],
+                                        v_break_position=v_break,
+                                        amplitude=amplitude,
+                                        delta=delta)
+                                    )
+    
+    '''SmoothlyBrokenPowerLaw1D(amplitude=amplitude,
                                   x_break = v_break,
                                   alpha_1= a1,
                                   alpha_2 = a2,
                                   delta=delta
-                                 )
+                                 )'''
     n_e = lambda ne_0, v_line, p=5: ne_0 * (v_line/0.2)**-p
 
 
@@ -430,22 +442,28 @@ if __name__ == "__main__":
     ne_profile_3 = n_e(1.5e8, v_shells, p=8)
     
     ne_profiles = [ne_profile_2, ne_profile_3]
-    a1_ = [2,3,4,5,7]
+    '''a1_ = [2,3,4,5,7]
     a2_ = [3,4,5,7,10]
-    for i,j in np.ndindex((3,3)):
+    for i,j in np.ndindex((len(a1_), len(a2_))):
         ne_profiles.append(
                 broken_p_law(a1_[i], a2_[j])(v_shells)
                 )
         param_names.append(f'$p_1$={a1_[i]}, $p_2$={a2_[j]}')
         ne_profiles.append(
+            broken_p_law(a1_[i], a2_[j], v_break=0.23, amplitude=1e7)(v_shells)
+        )
+        param_names.append(f'$p_1$={a1_[i]}, $p_2$= {a2_[j]}, v_break=0.23')
+        ne_profiles.append(
             broken_p_law(a1_[i], a2_[j], v_break=0.25, amplitude=1e7)(v_shells)
         )
-        param_names.append(f'$p_1$={a1_[i]}, $p_2$= {a2_[j]}, v_break=0.25')
-
+        param_names.append(f'$p_1$={a1_[i]}, $p_2$= {a2_[j]}, v_break=0.25')'''
     spectrum_residuals = np.zeros(len(ne_profiles))
     #my_ne_profile = broken_p_law(2,7, v_break=0.25, amplitude=1e7)(v_shells)
     my_ne_profile = broken_p_law(2,7, v_break=0.2, amplitude=1e7)(v_shells)
-    my_ne_profile2 = broken_p_law(3,10, v_break=0.23, amplitude=5e6)(v_shells)
+
+    my_ne_profile2 = broken_p_law(5,5, v_break=0.2, amplitude=1e7)(v_shells)#/10
+    #print("n_e", my_ne_profile2.tolist())
+    #exit()
     for k, ne_profile in enumerate([my_ne_profile2]):
         for i, (epoch, T_e) in enumerate(T_elec_epochs.items()):
             tau_shells = []
@@ -471,12 +489,12 @@ if __name__ == "__main__":
             #exit()
             #exit()
 
-            #mp.context._force_start_method('spawn')
+            mp.context._force_start_method('spawn')
             compute_tau_shell_worker = partial(_compute_tau_shell_sr,
                                             #epoch=epoch,
                                             #T_phot=T_phots[i],
                                                 #T_electrons=T_e,
-                                                atomic_mass=88,
+                                                #atomic_mass=88,
                                                 #mass_fraction=mass_fractions[i],
                                                 #v_phot=v_phots[i]
                                                 )
@@ -490,29 +508,30 @@ if __name__ == "__main__":
 
             with ProcessingPool(num_cores) as pool:
                 results = pool.map(lambda params: compute_tau_shell_worker(*params),
-                                     zip(v_shells,
-                                          ne_profile,
-                                          epoch * np.ones_like(v_shells),
-                                          v_phots[i] * np.ones_like(v_shells),
-                                          T_phots[i] * np.ones_like(v_shells),
-                                          T_e * np.ones_like(v_shells),
-                                          mass_fractions[i] * np.ones_like(v_shells)
-                                          ))
+                                        [(v_shells[idx],
+                                          None,#ne_profile[idx],
+                                          None,#mass_fractions[i] * ne_profile[idx],
+                                          epoch,
+                                          v_phots[i],
+                                          T_phots[i],
+                                          T_e,
+                                          mass_fractions[i])
+                                           for idx in range(len(v_shells))])
         
                 lte_results = pool.map(lambda params: _compute_LTE_tau_worker(*params),
-                                     zip(v_shells,
-                                         ne_profile,
-                                         epoch * np.ones_like(v_shells),
-                                         T_phots[i] * np.ones_like(v_shells),
-                                         mass_fractions[i] * np.ones_like(v_shells),
-                                         v_phots[i] * np.ones_like(v_shells),
-                                         ))
+                                     [(v_shells[v_i],
+                                         ne_profile[v_i],
+                                         epoch,
+                                         T_phots[i],
+                                         mass_fractions[i],
+                                         v_phots[i],
+                                         ) for v_i in range(len(v_shells))])
 
             print("COUNTING!: ", i, epoch, T_e)
             # 'plum', 'orchid', 'mediumpurple', 'mediumslateblue',
             colors = ['mediumpurple'] + list(mpl.colormaps['coolwarm'](np.linspace(0, 1., len(T_elec_epochs)-1)))
             
-            mark_offsets = [-0.9E-16, 0., -2.5E-17, -0.7E-16, -0.9E-16]
+            mark_offsets = [-0.9E-16, 0., -2.7E-17, -0.7E-16, -0.9E-16]
             # mark the Sr II triplets
             if True: 
                 ax.vlines(triplets * (1-v_phots[i]), 2e-16 + offsets[i] + mark_offsets[i],
@@ -544,12 +563,19 @@ if __name__ == "__main__":
             #fitted_spectral_line = utils.fit_planck_with_pcygni(spec_ep[:,0], spec_ep[:,1], telluric_cutouts_albert)
             T = fitted_cont.params['T'].value
             T_sigma = fitted_cont.params['T'].stderr
-            amplitude = np.pi * fitted_cont.params['amplitude'].value
+            amplitude = fitted_cont.params['amplitude'].value
             print("Value of amplitude:", amplitude)
             print("Calculated luminosity distance:",
                    utils.calc_luminosity_distance(amplitude/np.pi, v_phots[i] * c, epoch * u.day))
             print(rf"Fitted blackbody temperature: {T:.1f} K")
-            flux_scale_amplitude = amplitude * 1e-20
+
+            t_days = epoch * u.day
+            # photospheric radius at which the line formation begins.
+            R_ph = (v_phots[i]*c * t_days).to("cm").value
+            # the flux is diluted also due to the distance to the observer. This information was contained
+            # in the fit. Now, I will later rescale the flux from the line formation code to 
+            # match the observer
+            flux_scale_amplitude = ((1/R_ph)**2) * amplitude * 1e-20
             # this continuum object will be passed to the line formation code.
             continuum = BlackBody(temperature = T * u.K, scale=1*u.Unit("erg/(s cm2 Hz sr)"))
             
@@ -747,7 +773,7 @@ if __name__ == "__main__":
     plt.tight_layout()
     #plt.savefig(f'fitted_pcygni.png', dpi=300)
     
-    #display_spectrum_residuals(v_shells, ne_profiles, spectrum_residuals, param_names)
+    #display_best_fit_density_profiles(v_shells, ne_profiles, spectrum_residuals, param_names)
     """
     _fig, _ax = plt.subplots()
     _ax.plot([1.17, 1.43, 2.42, 3.41, 4.40], np.array(tau_phots_epochs),
