@@ -40,6 +40,7 @@ h = cst.h.cgs.value
 k_B = cst.k_B.cgs.value
 
 
+# using a dataclass with JAX requires this massive annotation for some reason...
 @partial(jax.tree_util.register_dataclass,
          data_fields=['tau_grid_eq', 'tau_grid_polar', 'escape_prob_eq', 'escape_prob_polar',
                       'velocity_grid', 'g_upper', 'g_lower', 'n_upper', 'n_lower'],
@@ -173,15 +174,18 @@ class Photosphere:
         The source function, defined as the ratio of the emissivity to the absorption coefficient
         has the following form.
         """
-
         if mode == 'dilute-LTE':
             T = self.continuum.temperature.value
             delta_v = (v - self.v_phot)/c
+            # doppler shifted radiation temperature for this velocity shell 'v'
             T /= (1/jnp.sqrt(1 - delta_v**2) * (1+delta_v))
+            # the source function would be the diluted Planck function, with doppler shifted temperature
             return W(v, self.v_phot) * (2 * h * nu**3 / c**2) / (jnp.exp(h * nu / (k_B * T)) - 1)
-        n_u = 10**jnp.interp(v / c, v_grid, jnp.log10(n_u_grid))
-        n_l = 10**jnp.interp(v / c, v_grid, jnp.log10(n_l_grid))
-        return  (2 * h * nu**3 / c**2) / ((g_u * n_l) / (g_l * n_u) - 1)
+        else:
+            # explicitly calculate from level populations
+            n_u = 10**jnp.interp(v / c, v_grid, jnp.log10(n_u_grid))
+            n_l = 10**jnp.interp(v / c, v_grid, jnp.log10(n_l_grid))
+            return  (2 * h * nu**3 / c**2) / ((g_u * n_l) / (g_l * n_u) - 1)
 
     @jax.jit
     def S(self, nu, p, z, r, r_min, r_max, v, sob_esc_prob, g_u, g_l, n_u_grid, n_l_grid, v_grid, nu_0, continuum, mode='level-pop'):
@@ -233,11 +237,12 @@ class Photosphere:
         # and that's just 'z' in the impact geometry.
         order = jnp.argsort(z_arr)[::-1]
         # a helper function, because the S function is a bit long
-        # TODO: the sobolev escape probability is to be be allowed to be different in the poles and the equator
-        S_i = lambda line, p, z, r, v, inside_polar_ejecta: self.S(nu, p, z, r, self.r_min, self.r_max, v, jnp.where(inside_polar_ejecta,
-                                                                                                         line.sob_esc_prob_polar(v/c),
-                                                                                                         line.sob_esc_prob_eq(v/c)),
-                                                    line.g_upper, line.g_lower, line.n_upper, line.n_lower, line.velocity_grid, line.nu_0, continuum)  
+        S_i = lambda line, p, z, r, v, inside_polar_ejecta: self.S(nu, p, z, r, self.r_min, self.r_max, v,
+                                                                    jnp.where(inside_polar_ejecta,
+                                                                                line.sob_esc_prob_polar(v/c),
+                                                                                line.sob_esc_prob_eq(v/c)),
+                                                                    line.g_upper, line.g_lower, line.n_upper, line.n_lower,
+                                                                    line.velocity_grid, line.nu_0, continuum)
         
         tau_i = jnp.zeros_like(z_arr)
         _Si = jnp.zeros_like(z_arr)
@@ -517,5 +522,15 @@ class Photosphere:
 
 
 if __name__ == "__main__":
-    # some sanity checking plots
+    # some sanity checking plots and example usage
+    photosphere = Photosphere(v_phot=0.245 * cst.c.cgs.value,
+                              v_max=0.45 * cst.c.cgs.value,
+                              continuum=BlackBody(temperature=4400 * u.K, scale=1*u.Unit("erg / (cm2 s Hz sr)")),
+                              t_d = (1.43 * u.day).cgs.value,
+                              line_list=[], # the list has to be non-empty for spectrum calculation to work as of now
+                              polar_opening_angle=np.pi/3,
+                              observer_angle=-np.pi/8
+                            )
+    photosphere.visualize_polar_3D()
+
     print("Nothing crashed! Can we celebrate that?")
