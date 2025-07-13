@@ -8,7 +8,9 @@ import jax
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
 import numpy as np
-from astropy.constants import c, h, k_B
+import astropy.constants as cst
+
+from interpax import interp1d
 from astropy.modeling.physical_models import BlackBody
 from astropy.units import Quantity
 from scipy.integrate import quad
@@ -27,22 +29,16 @@ num_cores = mp.cpu_count()
 # There isn't any point in it using GPU when there aren't enough points to calculate.
 jax.config.update('jax_platform_name', 'cpu')
 jax.config.update('jax_num_cpu_devices', num_cores)
-# to use 64 bit floats?
-#jax.config.update('jax_enable_x64', True)
+# using 64 bit floats is necessary when cubing the frequency for instance.
+# An overflow due to lack in in precision may lead to np.inf or NaN values
+jax.config.update('jax_enable_x64', True)
 #print("Number of CPU cores available", jax.device_count())
 
 # I don't like cgs units, but we're doing astronomy so I have to live with it
-c = c.cgs.value
-h = h.cgs.value
-k_B = k_B.cgs.value
+c = cst.c.cgs.value
+h = cst.h.cgs.value
+k_B = cst.k_B.cgs.value
 
-
-@jax.jit
-def fast_interpolate(x_new: float, v_grid: np.array, y_grid: np.array):
-    """
-    A fast interpolation function to be used in the numba-compiled code
-    """
-    return jnp.interp(x_new, v_grid, y_grid)
 
 @jax.jit
 def W(r, r_min):
@@ -52,33 +48,35 @@ def W(r, r_min):
     return (1 - jnp.sqrt(1 - (r_min/r)**2)) / 2
 
 @jax.jit
-def source_function(nu, v, g_u, g_l, n_u_grid, n_l_grid, v_grid, nu_0, continuum, photosphere, mode='nLTE'):
+def source_function(nu, v, g_u, g_l, n_u_grid, n_l_grid, v_grid, nu_0, continuum, photosphere, r, r_min, mode='dilute-LTE'):
     """
     The source function, defined as the ratio of the emissivity to the absorption coefficient
     has the following form.
     """
-    if mode == 'LTE':
-        #T = photosphere.continuum.temperature.value
-        return continuum#(2 * h * nu_0**3 / c**2) / (jnp.exp(h * nu_0 / (k_B * T)) - 1)
-    n_u = jnp.interp(v / c, v_grid, n_u_grid)
-    n_l = jnp.interp(v / c, v_grid, n_l_grid)
-    return (2 * h * nu_0**3 / c**2) / (g_u * n_l / (g_l * n_u) - 1)
+    if mode == 'dilute-LTE':
+        T = photosphere.continuum.temperature.value
+        delta_v = (v - photosphere.v_phot)/c
+        T /= (1/jnp.sqrt(1 - delta_v**2) * (1+delta_v))
+        return W(r, r_min) * (2 * h * nu**3 / c**2) / (jnp.exp(h * nu / (k_B * T)) - 1)
+    n_u = 10**jnp.interp(v / c, v_grid, jnp.log10(n_u_grid))
+    n_l = 10**jnp.interp(v / c, v_grid, jnp.log10(n_l_grid))
+    source_func = (2 * h * nu**3 / c**2) / ((g_u * n_l) / (g_l * n_u) - 1)
+    return source_func
 
 @jax.jit
 def S(nu, p, z, r, r_min, r_max, v, sob_esc_prob, g_u, g_l, n_u_grid, n_l_grid, v_grid, nu_0, continuum, photosphere, mode='level-pop'):
-
     outside_photosphere = (r < r_min) | (r > r_max)
     occulted_region = (z < 0) & (p < r_min)
     if mode == 'level-pop':
         # the level populations are given from the NLTE calculation
         return jnp.where(outside_photosphere | occulted_region,
                         1e-10,
-                        sob_esc_prob*source_function(nu, v, g_u, g_l, n_u_grid, n_l_grid, v_grid, nu_0, continuum, photosphere)#/np.pi
+                        source_function(nu, v, g_u, g_l, n_u_grid, n_l_grid, v_grid, nu_0, continuum, photosphere, r, r_min)
                         )
     else:
         return jnp.where(outside_photosphere | occulted_region,
                     1e-10,
-                    sob_esc_prob * W(r, r_min)*continuum
+                    W(r, r_min)*continuum
                     )
 
 
@@ -110,12 +108,12 @@ class LineTransition:
         self.wavelength = self.wavelength#.value
         # compile an interpolation grid for tau, n_upper and n_lower
         # later, one can sample from these while integrating.
-        self.n_u = lambda v: fast_interpolate(v/c, self.velocity_grid, self.n_upper)
-        self.n_l = lambda v: fast_interpolate(v/c, self.velocity_grid, self.n_lower)
-        self._tau_interp_eq = lambda v: fast_interpolate(v/c, self.velocity_grid, self.tau_grid_eq)
-        self._tau_interp_polar = lambda v: fast_interpolate(v/c, self.velocity_grid, self.tau_grid_polar)
-        self.sob_esc_prob_eq = lambda v: fast_interpolate(v/c, self.velocity_grid, self.escape_prob_eq)
-        self.sob_esc_prob_polar = lambda v: fast_interpolate(v/c, self.velocity_grid, self.escape_prob_polar)
+        self.n_u = lambda v: 10**jnp.interp(v/c, self.velocity_grid, jnp.log10(self.n_upper))
+        self.n_l = lambda v: 10**jnp.interp(v/c, self.velocity_grid, jnp.log10(self.n_lower))
+        self._tau_interp_eq = lambda v: 10**jnp.interp(v/c, self.velocity_grid, jnp.log10(self.tau_grid_eq))
+        self._tau_interp_polar = lambda v: 10**jnp.interp(v/c, self.velocity_grid, jnp.log10(self.tau_grid_polar))
+        self.sob_esc_prob_eq = lambda v: 10**jnp.interp(v/c, self.velocity_grid, jnp.log10(self.escape_prob_eq))
+        self.sob_esc_prob_polar = lambda v: 10**jnp.interp(v/c, self.velocity_grid, jnp.log10(self.escape_prob_polar))
 
  
 
@@ -141,20 +139,9 @@ def calc_z(p: float, t: float, delta: np.array):
     # This is only going to be when delta is unphysically large (e.g. calculating if a 400nm photon
     # was redshifted to be in resonance with the 1 micron triplet; that's not happening even for v_max=c)
     B = jnp.where(jnp.isnan(B), 0., B)
-    z = c * t * A * (1 - B)
+    z = c * t * A * (1 - B)# *(1-1/delta)#
     return z
 
-@jax.jit
-def is_polar_ejecta(p, z, polar_opening_angle, observer_inclination_angle):
-    """
-    For implementing the two-component model, check if the point (p, z)
-    is within the "polar" ejecta region or not.
-    Also takes into account an observer's inclination angle
-    """
-    beta = observer_inclination_angle
-    p_new = p * jnp.cos(beta) + z * jnp.sin(beta)
-    z_new = -p * jnp.sin(beta) + z * jnp.cos(beta)
-    return jnp.where((jnp.abs((jnp.arctan(p_new/z_new))) < polar_opening_angle/2), 1, 0)
 
 @jax.jit
 def I(p, continuum, r_min):
@@ -190,7 +177,105 @@ class Photosphere:
         #self.v_max = self.v_max.to("cm/s").value
         #self.t_d = self.t_d.to("s").value
         #print("Initializing Photosphere for lines", self.line_wavelengths*1e7)
-    
+
+
+    def visualize_polar_3D(self):
+        fig = plt.figure(figsize=(12,6))
+        ax = fig.add_subplot(1, 2, 1, projection='3d')
+
+        z = np.linspace(-self.v_max/c, self.v_max/c, 50)
+
+        p = np.linspace(0, self.v_max/c, 100)
+        phi = np.linspace(0, 2*np.pi, 100, endpoint=False)
+        P, PHI, Z = np.meshgrid(p, phi, z)
+        #x = np.linspace(-self.v_max/c, self.v_max/c, 50)
+        #y = np.linspace(-self.v_max/c, self.v_max/c, 50)
+        x = P * np.cos(PHI)
+        y = P * np.sin(PHI)
+
+        #X,Y,Z= np.meshgrid(x,y,z, indexing='ij')
+        X = x.ravel()
+        Y = y.ravel()
+        Z = Z.ravel()
+
+        R = np.sqrt(X**2 + Y**2 + Z**2)
+        within_kilonova = R <= self.v_max/c
+
+        polar_or_not = self.is_polar(X[within_kilonova],Y[within_kilonova],Z[within_kilonova],R[within_kilonova])
+        colors = np.where(polar_or_not, 'blue', 'red')
+
+        ax.scatter(X[within_kilonova],Y[within_kilonova],Z[within_kilonova], alpha=0.02, s=1, c=colors)
+
+        r_max = self.v_max / c
+        theta = np.linspace(0, np.pi, 10)       # polar angle
+        phi   = np.linspace(0, 2*np.pi, 2*10)   # azimuth
+        THETA, PHI   = np.meshgrid(theta, phi, indexing='ij')
+        xs = r_max * np.sin(THETA) * np.cos(PHI)
+        ys = r_max * np.sin(THETA) * np.sin(PHI)
+        zs = r_max * np.cos(THETA)
+
+        ax.plot_wireframe(xs, ys, zs, color='k', linestyle='--', linewidth=0.5, alpha=0.7)
+        arrow_len = self.v_max / c * 1.3
+        dx = 0
+        dy = 0
+        dz = arrow_len
+        ax.quiver(0, 0, 0, dx, dy, dz, color='k', linewidth=2, arrow_length_ratio=0.1)
+        ax.text(dx * 1.05, dy, dz * 1.05, "Observer", ha='center', color='black')
+
+        ax.set_box_aspect([1, 1, 1])
+        #ax.view_init(elev=0, azim=0) # set initial view of the 3D plot
+        ax.set_xlabel("x [c]")
+        ax.set_ylabel("y [c]")
+        ax.set_zlabel("z [c]")
+
+        # now make a 2D projection of what the observer sees.
+        ax2 = fig.add_subplot(1, 2, 2)
+        N = 300
+        extent = self.v_max / c
+        x = np.linspace(-extent, extent, N)
+        y = np.linspace(-extent, extent, N)
+        X2, Y2 = np.meshgrid(x, y)
+
+        observer_plane_z = self.v_max/(2*c)
+
+        Z2 = observer_plane_z * np.ones_like(X2) 
+        R2 = np.sqrt(X2**2 + Y2**2 + Z2**2)
+        
+        # Create a transparent z=0 plane (the observer's projection plane)
+        ax.plot_surface(X2, Y2, Z2, color='silver', alpha=0.2, zorder=0)
+        # and a boundary to draw around the "plane"
+        boundary = np.array([
+            [-r_max, -r_max],
+            [ r_max, -r_max],
+            [ r_max,  r_max],
+            [-r_max,  r_max],
+            [-r_max, -r_max]  # close the loop
+        ])
+        ax.plot(boundary[:,0], boundary[:,1], observer_plane_z, ls='--', color='k', linewidth=0.75)
+        is_polar_grid = np.vectorize(self.is_polar)(X2, Y2, Z2, R2) & (R2 <= self.v_max/c)
+
+        im = ax2.imshow(is_polar_grid, origin='lower',
+                        extent=(-extent, extent, -extent, extent),
+                        cmap='coolwarm_r', aspect='equal')
+        
+        v_phot_circle = plt.Circle((0, 0), self.v_phot/c, ec='w',ls='--', fill=False, alpha=1)
+        v_max_circle = plt.Circle((0, 0), self.v_max/c, ec='w', ls=':', fill=False, alpha=1)
+        
+        ax2.add_artist(v_phot_circle)
+        ax2.add_artist(v_max_circle)
+
+        ax2.set_xlabel("x [c]")
+        ax2.set_ylabel("y [c]")
+        ax2.set_title("Observer's 2D Projection")
+        fig.colorbar(im, ax=ax, label="Polar Ejecta", fraction=0.046, pad=0.04)
+
+        plt.tight_layout()
+        # save the 3D part only
+        #plt.savefig("polar_ejecta_3D_{self.observer_angle:.2f}.png", dpi=300, bbox_inches=ax.get_tightbbox(fig.canvas.get_renderer()))
+        # the full 2-panel plot.
+        plt.savefig("polar_ejecta_3D_with_projection_{self.observer_angle:.2f}.png", dpi=300)
+        plt.show()
+
 
     def visualize_polar_region(self):
         fig, ax = plt.subplots()
@@ -254,14 +339,11 @@ class Photosphere:
 
     @jax.jit
     def is_polar(self, x, y, z, r):
-        beta = self.observer_angle
-        # tilt, for the polar ejecta cone by the observer angle
-        x_rot = x * jnp.cos(beta) + z*jnp.sin(beta)
-        y_rot = y
-        z_rot = -x * jnp.sin(beta) + z * jnp.cos(beta)
-        inside_polar = jnp.abs(jnp.arcsin(jnp.sqrt(x_rot**2 + y_rot**2)/r)) <= self.polar_opening_angle/2
-                        #jnp.abs(z_rot / r) >= jnp.cos(self.polar_opening_angle/2)
-        return inside_polar
+        β = self.observer_angle
+        nx =jnp.sin(β)
+        nz = jnp.cos(β)
+        dot = (x*nx + z*nz) / jnp.maximum(r, 1e-12)
+        return jnp.abs(dot) >= jnp.cos(self.polar_opening_angle/2)
 
     @jax.jit
     def I_emit(self, nu: float, p: float, phi: float, delta_arr: jnp.array, continuum: float):
@@ -282,21 +364,25 @@ class Photosphere:
         order = jnp.argsort(z_arr)[::-1]
         # a helper function, because the S function is a bit long
         # TODO: the sobolev escape probability is to be be allowed to be different in the poles and the equator
-        S_i = lambda line, p, z, r, v: S(nu, p, z, r, self.r_min, self.r_max, v, line.sob_esc_prob_eq(v/c), line.g_upper, line.g_lower, line.n_upper, line.n_lower, line.velocity_grid, line.nu_0, continuum, self)  
+        S_i = lambda line, p, z, r, v, inside_polar_ejecta: S(nu, p, z, r, self.r_min, self.r_max, v, jnp.where(inside_polar_ejecta,
+                                                                                                         line.sob_esc_prob_polar(v/c),
+                                                                                                         line.sob_esc_prob_eq(v/c)),
+                                                    line.g_upper, line.g_lower, line.n_upper, line.n_lower, line.velocity_grid, line.nu_0, continuum, self)  
         
         tau_i = jnp.zeros_like(z_arr)
         _Si = jnp.zeros_like(z_arr)
         
         for i, line in enumerate(self.line_list):
             tau_i = tau_i.at[i].set(self.tau(line, p, z_arr[i], r_arr[i], v_arr[i], inside_polar[i]))
-            _Si = _Si.at[i].set(S_i(line, p, z_arr[i], r_arr[i], v_arr[i]))
+            _Si = _Si.at[i].set(S_i(line, p, z_arr[i], r_arr[i], v_arr[i], inside_polar[i]))
         
         tau_i = jnp.array(tau_i)[order]
         _Si = jnp.array(_Si)[order]
         
+        # summation is as per eqn (22) of Jeffrey & Branch (1990)
         I_abs = I(p, continuum, self.r_min)*jnp.exp(-jnp.sum(tau_i))
-        I_scat = jnp.sum(_Si * (1 - jnp.exp(-tau_i)) * jnp.exp(-jnp.cumsum(tau_i) + tau_i))
-
+        I_scat = jnp.sum(_Si * (1 - jnp.exp(-tau_i)) \
+                         * jnp.exp(-jnp.cumsum(tau_i) + tau_i))
         return (I_abs + I_scat)
 
 
@@ -324,7 +410,7 @@ class Photosphere:
     
     def calc_spectral_flux(self, nu_grid, line_masks, B_nu_grid, p_grid):
         delta_arr = nu_grid[:, None] / jnp.array(self.rest_frequencies)[None,:]
-        calc_one = lambda nu, delta, line_mask, B: self.calc_flux_at_nu(nu, delta, line_mask,  p_grid, B)
+        #calc_one = lambda nu, delta, line_mask, B: self.calc_flux_at_nu(nu, delta, line_mask,  p_grid, B)
         #params = [
         #    (nu, nu/self.rest_frequencies, line_masks[i], B_nu_grid[i], p_grid)
         #    for i, nu in enumerate(nu_grid)
@@ -344,8 +430,10 @@ class Photosphere:
         """
         There are parts of the spectrum where there are no lines
         In those parts, the flux is just the continuum.
-        Use this function to get the mask of the line regions and avoid
-        calculating I_emit in those regions.
+
+        Use this function to mask those regions and later avoid
+        calculating I_emit in those regions. Just the continuum flux
+         can be returned in those parts instead of an unnecessary explicit calculation.
         """
          # Compute the influence range of each line
         nu_min_arr = self.rest_frequencies / (1 + self.v_max / c)
@@ -366,7 +454,7 @@ class Photosphere:
         #plt.show()
         return ~mask
 
-    def calc_spectrum(self, start_wav=2_350*u.AA, end_wav=24_500*u.AA, n_points=200):
+    def calc_spectrum(self, start_wav=2_350*u.AA, end_wav=24_000*u.AA, n_points=500):
         """
         I was thinking, if I pass v_phot and v_max here that can be used for a fitting routine
         it can be used to update v_phot and v_max set in the Photosphere object
@@ -386,12 +474,12 @@ class Photosphere:
         lamb_grid = (c/nu_grid) * u.cm
         Fnu_list = []
 
-        # pre-compute the continuum flux (passed as a BlackBody object)
+        # pre-compute the continuum on a grid
         B_nu_grid = self.continuum(nu_grid * u.Hz)
 
         # I will have to convert to cgs units for consistency and then strip the units before calculating spectrum 
-        Bnu_cgs_unit = B_nu_grid.unit
-        B_nu_grid = B_nu_grid.value
+        Bnu_cgs_unit = B_nu_grid.cgs.unit
+        B_nu_grid = B_nu_grid.cgs.value
 
         # In a lot of the spectrum, there may not be any opacity to cause absorption/emission
         # in those parts, just return the continuum. This mask is used to decide that.
@@ -400,16 +488,19 @@ class Photosphere:
         p_grid = np.linspace(0, self.r_max, 200)
         #print("Starting flux integration!")
         t_i = time.time()
+
+        # and this is the calculated spectrum!
         Fnu_list = self.calc_spectral_flux(nu_grid, line_masks, B_nu_grid, p_grid)
 
         #t_i = time.time()
         Fnu_list = np.array(Fnu_list)
+        # convert from frequency to wavelength units
         F_lambda = convert_flux(nu_grid * u.Hz, Fnu_list * Bnu_cgs_unit * u.sr, out_flux_unit='erg /(s AA cm2)')
         wavelength_grid = (lamb_grid).to("AA").value
         print(f"Time taken: {(time.time() - t_i):.3f} seconds for full spectrum calculation")
         #print("Took", t_i - time.time(), "to prepare F_lambda")
         #print("Returning now!")
-        return wavelength_grid, F_lambda.value/(np.pi*self.r_min**2)
+        return wavelength_grid, F_lambda.value
 
 
 if __name__ == "__main__":
